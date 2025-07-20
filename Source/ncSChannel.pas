@@ -71,10 +71,6 @@ type
   HCRYPTKEY = pointer;
   HCRYPTHASH = pointer;
   HCERTSTORE = pointer;
-  //ALG_ID = cardinal;
-  //TALG_IDs = array[word] of ALG_ID;
-  //PALG_IDs = ^TALG_IDs;
-
 
   CRYPTOAPI_BLOB = record
     cbData: DWORD;
@@ -353,7 +349,7 @@ const
 
 
 type
-  {$ifdef CPU64}
+  {$ifdef WIN64}
   LONG_PTR = Int64;
   {$else}
   LONG_PTR = integer;
@@ -365,14 +361,18 @@ type
 
   _HMAPPER = pointer;
 
-  TCredHandle = record
+  /// SSPI context handle
+  TSecHandle = record
     dwLower: LONG_PTR;
     dwUpper: LONG_PTR;
   end;
-  PCredHandle = ^TCredHandle;
+  PSecHandle = ^TSecHandle;
 
-  TCtxtHandle = type TCredHandle;
-  PCtxtHandle = ^TCtxtHandle;
+  // some context aliases, as defined in SSPI headers
+  TCredHandle = type TSecHandle;
+  PCredHandle = type PSecHandle;
+  TCtxtHandle = type TSecHandle;
+  PCtxtHandle = type PSecHandle;
 
   TSChannelCred = record
     dwVersion: cardinal;
@@ -486,7 +486,7 @@ function CertOpenStore(lpszStoreProvider: PAnsiChar; dwEncodingType: cardinal;
 function CertCloseStore(hCertStore: HCERTSTORE; dwFlags: cardinal): BOOL; stdcall;
   external 'crypt32.dll';
 
-function CertEnumCertificatesInStore(hCertStore: HCERTSTORE; 
+function CertEnumCertificatesInStore(hCertStore: HCERTSTORE;
   pPrevCertContext: PCCERT_CONTEXT): PCCERT_CONTEXT; stdcall;
   external 'crypt32.dll';
 
