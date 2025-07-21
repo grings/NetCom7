@@ -14,6 +14,8 @@ unit ncUDPSockets;
 //
 // /////////////////////////////////////////////////////////////////////////////
 
+{$DEFINE DEBUG}  // Enable debug logging for chunk processing
+
 {$IF CompilerVersion >= 21.0}
 {$WEAKLINKRTTI ON}
 {$RTTI EXPLICIT METHODS([]) PROPERTIES([]) FIELDS([])}
@@ -27,8 +29,8 @@ uses
 {$ELSE}
   Posix.SysSocket, Posix.Unistd,
 {$ENDIF}
-  System.Classes, System.SysUtils, System.SyncObjs, System.Math, System.Diagnostics, System.TimeSpan,
-  ncLines, ncSocketList, ncThreads, ncIPUtils;
+  System.Classes, System.SysUtils, System.SyncObjs, System.Math, System.Diagnostics, System.TimeSpan, System.DateUtils,
+  ncLines, ncSocketList, ncThreads, ncIPUtils, System.Generics.Collections;
 
 const
   DefPort = 16233;
@@ -42,6 +44,11 @@ const
 
   // UDP Command Protocol Constants
   UDP_COMMAND_MAGIC = $4E43; // 'NC' signature for protocol detection
+
+  // Auto-chunking constants
+  UDP_MAX_SAFE_PAYLOAD = 16384; // Larger payload size for better performance (within reasonable UDP limits)
+  UDP_CHUNK_MAGIC = $4E44;     // 'ND' signature for chunk packets
+  UDP_CHUNK_TIMEOUT = 5000;    // 5 seconds timeout for incomplete transfers
 
 type
   // UDP Command Header Structure
@@ -58,6 +65,48 @@ type
     // Variable data follows after this structure
   end;
 
+  // UDP Chunk Header Structure (for auto-chunking large commands)
+  TUdpChunkHeader = packed record
+    Magic: UInt16;       // Chunk magic signature ($4E44 = 'ND')
+    TransferID: UInt32;  // Unique transfer identifier
+    ChunkIndex: UInt16;  // Current chunk number (0-based)
+    TotalChunks: UInt16; // Total number of chunks
+    OriginalCmd: Integer; // Original command ID
+    OriginalFlags: Byte;  // Original command flags
+    OriginalSequence: UInt16; // Original sequence number
+    // Variable chunk data follows
+  end;
+
+  // Chunk reassembly tracking - OPTIMIZED
+  TChunkTransfer = record
+    TransferID: UInt32;
+    OriginalCmd: Integer;
+    OriginalFlags: Byte;
+    OriginalSequence: UInt16;
+    TotalChunks: UInt16;
+    ReceivedChunks: UInt16;
+    LastActivity: TDateTime;
+    CompleteData: TBytes;        // Pre-allocated full buffer
+    ChunkReceived: array of Boolean; // Track which chunks we have
+  end;
+
+  // Chunk transfer manager - OPTIMIZED
+  TChunkManager = class
+  private
+    FTransfers: TDictionary<UInt32, TChunkTransfer>; // Hash table for O(1) lookup
+    FLock: TCriticalSection;
+    function GenerateTransferID: UInt32;
+    procedure CleanupExpiredTransfers;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    function StartTransfer(ACmd: Integer; AFlags: Byte; ASequence: UInt16; ATotalChunks: UInt16): UInt32;
+    function CreateTransferFromChunk(ATransferID: UInt32; ATotalChunks: UInt16; AOriginalCmd: Integer; AOriginalFlags: Byte; AOriginalSequence: UInt16): Boolean;
+    function AddChunk(ATransferID: UInt32; AChunkIndex: UInt16; const AChunkData: TBytes): Boolean;
+    function CompleteTransfer(ATransferID: UInt32; out ACmd: Integer; out AFlags: Byte;
+      out ASequence: UInt16; out ACompleteData: TBytes): Boolean;
+  end;
+
 resourcestring
   ECannotSetPortWhileSocketActiveStr = 'Cannot set Port property while socket is active';
   ECannotSetHostWhileSocketActiveStr = 'Cannot set Host property while socket is active';
@@ -71,8 +120,8 @@ type
   // Event types for UDP
   TncOnDatagramEvent = procedure(Sender: TObject; aLine: TncLine;const aBuf: TBytes; aBufCount: Integer;const SenderAddr: TSockAddrStorage) of object;
 
-  // UDP Command Protocol Event  
-  TncOnUDPCommandEvent = procedure(Sender: TObject; aLine: TncLine; const aSenderAddr: TSockAddrStorage; 
+  // UDP Command Protocol Event
+  TncOnUDPCommandEvent = procedure(Sender: TObject; aLine: TncLine; const aSenderAddr: TSockAddrStorage;
     aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16) of object;
 
 
@@ -88,6 +137,7 @@ type
     FReadBufferLen: Integer;
     FOnReadDatagram: TncOnDatagramEvent;
     FOnCommand: TncOnUDPCommandEvent;
+    FChunkManager: TChunkManager;  // For auto-chunking large commands
     function GetReadBufferLen: Integer;
     procedure SetReadBufferLen(const Value: Integer);
     function GetActive: Boolean; virtual; abstract;
@@ -154,11 +204,11 @@ type
     procedure Send(const aBuf; aBufSize: Integer); overload;
     procedure Send(const aBytes: TBytes); overload;
     procedure Send(const aStr: string); overload;
-    
+
     // UDP Command Protocol Methods
     procedure SendCommand(aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
     procedure SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
-    
+
     function Receive(aTimeout: Cardinal = 2000): TBytes;
     property Host: string read GetHost write SetHost;
   end;
@@ -205,11 +255,11 @@ type
     procedure SendTo(const aBuf; aBufSize: Integer; const DestAddr: TSockAddrStorage); overload;
     procedure SendTo(const aBytes: TBytes;const DestAddr: TSockAddrStorage); overload;
     procedure SendTo(const aStr: string; const DestAddr: TSockAddrStorage); overload;
-    
+
     // UDP Command Protocol Methods
     procedure SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
     procedure SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
-    
+
     function Receive(aTimeout: Cardinal = 2000): TBytes;
   end;
 
@@ -266,6 +316,7 @@ begin
   FReadBufferLen := DefReadBufferLen;
   FOnReadDatagram := nil;
   FOnCommand := nil;
+  FChunkManager := TChunkManager.Create; // Initialize the chunk manager
 
   SetLength(ReadBuf, DefReadBufferLen);
 
@@ -279,6 +330,7 @@ end;
 destructor TncUDPBase.Destroy;
 begin
   PropertyLock.Free;
+  FChunkManager.Free; // Free the chunk manager
   inherited Destroy;
 end;
 
@@ -682,70 +734,58 @@ end;
 
 procedure TncCustomUDPClient.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
-  Packet: TBytes;
-  PacketHeader: TUdpCommandPacket;
-  HeaderSize: Integer;
-  DataSize: Integer;
+  HeaderSize, DataSize, TotalSize: Integer;
   storage: TSockAddrStorage;
   addrV4: PSockAddrIn;
   addrV6: PSockAddrIn6;
+
+  // For normal sending
+  Packet: TBytes;
+  PacketHeader: TUdpCommandPacket;
+
+  // For chunking
+  ChunkHeader: TUdpChunkHeader;
+  ChunkPacket: TBytes;
+  TransferID: UInt32;
+  TotalChunks: UInt16;
+  ChunkIndex: UInt16;
+  CurrentPos: Integer;
+  ChunkDataSize: Integer;
+  MaxChunkDataSize: Integer;
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
 
-  // Build command packet header
-  PacketHeader.Magic := UDP_COMMAND_MAGIC;
-  PacketHeader.Header.Cmd := aCmd;
-  PacketHeader.Header.Flags := aFlags;
-  PacketHeader.Header.Sequence := aSequence;
-
-  // Calculate sizes
+  // Calculate total command packet size
   HeaderSize := SizeOf(TUdpCommandPacket);
   DataSize := Length(aData);
+  TotalSize := HeaderSize + DataSize;
 
-  // Allocate packet buffer
-  SetLength(Packet, HeaderSize + DataSize);
-
-  // Copy header to packet
-  Move(PacketHeader, Packet[0], HeaderSize);
-
-  // Copy data to packet (if any)
-  if DataSize > 0 then
-    Move(aData[0], Packet[HeaderSize], DataSize);
-
-  // Build destination address and send
+  // Build destination address first (common for both paths)
   case Family of
     afIPv4:
       begin
         FillChar(storage, SizeOf(storage), 0);
         storage.ss_family := AF_INET;
-
         addrV4 := PSockAddrIn(@storage);
         addrV4^.sin_family := AF_INET;
         addrV4^.sin_port := htons(aRemotePort);
-
         var addr := inet_addr(PAnsiChar(AnsiString(aRemoteHost)));
         if addr <> INADDR_NONE then
           addrV4^.sin_addr.S_addr := addr
         else
           raise Exception.Create('Invalid IPv4 address format');
-
-        SendTo(Packet, storage);
       end;
 
     afIPv6:
       begin
         if not TncIPUtils.IsIPv6ValidAddress(aRemoteHost) then
           raise Exception.Create('Invalid IPv6 address format');
-
         FillChar(storage, SizeOf(storage), 0);
         storage.ss_family := AF_INET6;
-
         addrV6 := PSockAddrIn6(@storage);
         addrV6^.sin6_family := AF_INET6;
         addrV6^.sin6_port := htons(aRemotePort);
-
-        // Handle link-local address with scope ID
         if TncIPUtils.IsLinkLocal(aRemoteHost) then
         begin
           var scopePos := Pos('%', aRemoteHost);
@@ -768,9 +808,68 @@ begin
         end
         else if not TncIPUtils.StringToAddress(aRemoteHost, addrV6^.sin6_addr) then
           raise Exception.Create('Invalid IPv6 address format');
-
-        SendTo(Packet, storage);
       end;
+  end;
+
+  // Check if auto-chunking is needed
+  if TotalSize <= UDP_MAX_SAFE_PAYLOAD then
+  begin
+    // ===============================================
+    // NORMAL SEND - Single packet
+    // ===============================================
+
+    PacketHeader.Magic := UDP_COMMAND_MAGIC;
+    PacketHeader.Header.Cmd := aCmd;
+    PacketHeader.Header.Flags := aFlags;
+    PacketHeader.Header.Sequence := aSequence;
+
+    SetLength(Packet, TotalSize);
+    Move(PacketHeader, Packet[0], HeaderSize);
+    if DataSize > 0 then
+      Move(aData[0], Packet[HeaderSize], DataSize);
+
+    SendTo(Packet, storage);
+  end
+  else
+  begin
+    // ===============================================
+    // AUTO-CHUNKING - Multiple packets
+    // ===============================================
+
+    MaxChunkDataSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
+    TotalChunks := (DataSize + MaxChunkDataSize - 1) div MaxChunkDataSize;
+    TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks);
+
+    CurrentPos := 0;
+    for ChunkIndex := 0 to TotalChunks - 1 do
+    begin
+      // Calculate chunk data size
+      ChunkDataSize := Min(MaxChunkDataSize, DataSize - CurrentPos);
+
+      // Build chunk header
+      ChunkHeader.Magic := UDP_CHUNK_MAGIC;
+      ChunkHeader.TransferID := TransferID;
+      ChunkHeader.ChunkIndex := ChunkIndex;
+      ChunkHeader.TotalChunks := TotalChunks;
+      ChunkHeader.OriginalCmd := aCmd;
+      ChunkHeader.OriginalFlags := aFlags;
+      ChunkHeader.OriginalSequence := aSequence;
+
+      // Build chunk packet
+      SetLength(ChunkPacket, SizeOf(TUdpChunkHeader) + ChunkDataSize);
+      Move(ChunkHeader, ChunkPacket[0], SizeOf(TUdpChunkHeader));
+      if ChunkDataSize > 0 then
+        Move(aData[CurrentPos], ChunkPacket[SizeOf(TUdpChunkHeader)], ChunkDataSize);
+
+      // Send chunk
+      SendTo(ChunkPacket, storage);
+
+      Inc(CurrentPos, ChunkDataSize);
+
+      // Yield thread to prevent UDP buffer overflow while maintaining speed
+      Sleep(1);  // Thread yield instead of 1ms delay for better performance
+    end;
+
   end;
 end;
 
@@ -912,6 +1011,14 @@ var
   CommandHeader: TUdpCommandHeader;
   CommandData: TBytes;
   PacketSize: Integer;
+
+  // For chunk handling
+  ChunkHeader: TUdpChunkHeader;
+  ChunkData: TBytes;
+  CompleteCmd: Integer;
+  CompleteFlags: Byte;
+  CompleteSequence: UInt16;
+  CompleteData: TBytes;
 begin
   // Initialize sender address structure
   SenderAddrLen := SizeOf(TSockAddrStorage);
@@ -927,43 +1034,93 @@ begin
 
   if BufRead > 0 then
   begin
-    // Check if this might be a command packet
-    if (BufRead >= SizeOf(TUdpCommandPacket)) then
+    // Check minimum size for any structured packet
+    if (BufRead >= SizeOf(UInt16)) then
     begin
-      // Extract magic number to check protocol
+      // Extract magic number to check protocol type
       Move(FClientSocket.ReadBuf[0], Magic, SizeOf(Magic));
-      
+
       if Magic = UDP_COMMAND_MAGIC then
       begin
-        // It's a command packet - extract command header
-        Move(FClientSocket.ReadBuf[SizeOf(UInt16)], CommandHeader, SizeOf(CommandHeader));
-        
-        // Extract command data (if any)
-        PacketSize := SizeOf(TUdpCommandPacket);
-        if BufRead > PacketSize then
+        // ===============================================
+        // NORMAL COMMAND PACKET
+        // ===============================================
+        if BufRead >= SizeOf(TUdpCommandPacket) then
         begin
-          SetLength(CommandData, BufRead - PacketSize);
-          Move(FClientSocket.ReadBuf[PacketSize], CommandData[0], BufRead - PacketSize);
-        end
-        else
-          SetLength(CommandData, 0);
-        
-        // Fire OnCommand event
-        if Assigned(FClientSocket.OnCommand) then
-          try
-            FClientSocket.OnCommand(FClientSocket,
-              FClientSocket.Line,
-              SenderAddr,
-              CommandHeader.Cmd,
-              CommandData,
-              CommandHeader.Flags,
-              CommandHeader.Sequence);
-          except
+          Move(FClientSocket.ReadBuf[SizeOf(UInt16)], CommandHeader, SizeOf(CommandHeader));
+
+          PacketSize := SizeOf(TUdpCommandPacket);
+          if BufRead > PacketSize then
+          begin
+            SetLength(CommandData, BufRead - PacketSize);
+            Move(FClientSocket.ReadBuf[PacketSize], CommandData[0], BufRead - PacketSize);
+          end
+          else
+            SetLength(CommandData, 0);
+
+          if Assigned(FClientSocket.OnCommand) then
+            try
+              FClientSocket.OnCommand(FClientSocket,
+                FClientSocket.Line,
+                SenderAddr,
+                CommandHeader.Cmd,
+                CommandData,
+                CommandHeader.Flags,
+                CommandHeader.Sequence);
+            except
+            end;
+        end;
+      end
+      else if Magic = UDP_CHUNK_MAGIC then
+      begin
+        // ===============================================
+        // CHUNK PACKET - Auto-reassembly
+        // ===============================================
+
+        if BufRead >= SizeOf(TUdpChunkHeader) then
+        begin
+          Move(FClientSocket.ReadBuf[0], ChunkHeader, SizeOf(ChunkHeader));
+
+          // Extract chunk data
+          PacketSize := SizeOf(TUdpChunkHeader);
+          if BufRead > PacketSize then
+          begin
+            SetLength(ChunkData, BufRead - PacketSize);
+            Move(FClientSocket.ReadBuf[PacketSize], ChunkData[0], BufRead - PacketSize);
+          end
+          else
+            SetLength(ChunkData, 0);
+
+          // Ensure transfer exists (create if first chunk)
+          FClientSocket.FChunkManager.CreateTransferFromChunk(ChunkHeader.TransferID, ChunkHeader.TotalChunks,
+            ChunkHeader.OriginalCmd, ChunkHeader.OriginalFlags, ChunkHeader.OriginalSequence);
+
+          // Add chunk to manager
+          FClientSocket.FChunkManager.AddChunk(ChunkHeader.TransferID, ChunkHeader.ChunkIndex, ChunkData);
+
+          // Check if transfer is complete
+          if FClientSocket.FChunkManager.CompleteTransfer(ChunkHeader.TransferID, CompleteCmd, CompleteFlags, CompleteSequence, CompleteData) then
+          begin
+            // Transfer complete - fire OnCommand with reassembled data
+            if Assigned(FClientSocket.OnCommand) then
+              try
+                FClientSocket.OnCommand(FClientSocket,
+                  FClientSocket.Line,
+                  SenderAddr,
+                  CompleteCmd,
+                  CompleteData,
+                  CompleteFlags,
+                  CompleteSequence);
+              except
+              end;
           end;
+        end;
       end
       else
       begin
-        // Not a command packet - treat as raw data
+        // ===============================================
+        // RAW DATA PACKET
+        // ===============================================
         if Assigned(FClientSocket.OnReadDatagram) then
           try
             FClientSocket.OnReadDatagram(FClientSocket,
@@ -977,7 +1134,9 @@ begin
     end
     else
     begin
-      // Too small to be a command packet - treat as raw data
+      // ===============================================
+      // TOO SMALL - Raw data
+      // ===============================================
       if Assigned(FClientSocket.OnReadDatagram) then
         try
           FClientSocket.OnReadDatagram(FClientSocket,
@@ -1015,6 +1174,213 @@ begin
     except
       // Continue processing even after errors
     end;
+end;
+
+{ TChunkManager }
+
+constructor TChunkManager.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FTransfers := TDictionary<UInt32, TChunkTransfer>.Create;
+end;
+
+destructor TChunkManager.Destroy;
+begin
+  FLock.Free;
+  FTransfers.Free;
+  inherited Destroy;
+end;
+
+function TChunkManager.GenerateTransferID: UInt32;
+begin
+  // Simple transfer ID generation (timestamp + random)
+  Result := UInt32(GetTickCount) xor UInt32(Random(65536));
+end;
+
+procedure TChunkManager.CleanupExpiredTransfers;
+var
+  Now: TDateTime;
+  TransferID: UInt32;
+  Transfer: TChunkTransfer;
+  ExpiredIDs: TArray<UInt32>;
+  I: Integer;
+begin
+  Now := System.SysUtils.Now;
+  SetLength(ExpiredIDs, 0);
+
+  // First pass: identify expired transfers
+  for Transfer in FTransfers.Values do
+  begin
+    if MilliSecondsBetween(Now, Transfer.LastActivity) > UDP_CHUNK_TIMEOUT then
+    begin
+      SetLength(ExpiredIDs, Length(ExpiredIDs) + 1);
+      ExpiredIDs[High(ExpiredIDs)] := Transfer.TransferID;
+    end;
+  end;
+
+  // Second pass: remove expired transfers
+  for I := 0 to High(ExpiredIDs) do
+    FTransfers.Remove(ExpiredIDs[I]);
+end;
+
+function TChunkManager.StartTransfer(ACmd: Integer; AFlags: Byte; ASequence: UInt16; ATotalChunks: UInt16): UInt32;
+var
+  Transfer: TChunkTransfer;
+  MaxDataSize: Integer;
+begin
+  FLock.Enter;
+  try
+    CleanupExpiredTransfers;
+    
+    Transfer.TransferID := GenerateTransferID;
+    Transfer.OriginalCmd := ACmd;
+    Transfer.OriginalFlags := AFlags;
+    Transfer.OriginalSequence := ASequence;
+    Transfer.TotalChunks := ATotalChunks;
+    Transfer.ReceivedChunks := 0;
+    Transfer.LastActivity := System.SysUtils.Now;
+    
+    // Optimize: Pre-allocate only maximum needed size (not over-allocate)
+    MaxDataSize := ATotalChunks * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
+    SetLength(Transfer.CompleteData, MaxDataSize);
+    SetLength(Transfer.ChunkReceived, ATotalChunks);
+    
+    FTransfers.Add(Transfer.TransferID, Transfer);
+    
+    Result := Transfer.TransferID;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TChunkManager.CreateTransferFromChunk(ATransferID: UInt32; ATotalChunks: UInt16; AOriginalCmd: Integer; AOriginalFlags: Byte; AOriginalSequence: UInt16): Boolean;
+var
+  Transfer: TChunkTransfer;
+  MaxDataSize: Integer;
+begin
+  Result := False;
+  FLock.Enter;
+  try
+    // Check if transfer already exists
+    if FTransfers.TryGetValue(ATransferID, Transfer) then
+    begin
+      Result := True; // Already exists
+      Exit;
+    end;
+
+    // Create new transfer
+    Transfer.TransferID := ATransferID;
+    Transfer.OriginalCmd := AOriginalCmd;
+    Transfer.OriginalFlags := AOriginalFlags;
+    Transfer.OriginalSequence := AOriginalSequence;
+    Transfer.TotalChunks := ATotalChunks;
+    Transfer.ReceivedChunks := 0;
+    Transfer.LastActivity := System.SysUtils.Now;
+
+    // Pre-allocate buffer for maximum possible data size
+    MaxDataSize := ATotalChunks * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
+    SetLength(Transfer.CompleteData, MaxDataSize);
+    SetLength(Transfer.ChunkReceived, ATotalChunks);
+
+    FTransfers.Add(Transfer.TransferID, Transfer);
+
+    Result := True;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TChunkManager.AddChunk(ATransferID: UInt32; AChunkIndex: UInt16; const AChunkData: TBytes): Boolean;
+var
+  Transfer: TChunkTransfer;
+  ChunkOffset: Integer;
+  DataSize: Integer;
+  TransferExists: Boolean;
+begin
+  Result := False;
+  DataSize := Length(AChunkData);
+  
+  // Quick validation before lock
+  if DataSize = 0 then Exit;
+  
+  // Optimize: Quick existence check to reduce lock contention
+  FLock.Enter;
+  try
+    TransferExists := FTransfers.TryGetValue(ATransferID, Transfer);
+  finally
+    FLock.Leave;
+  end;
+  
+  if not TransferExists then Exit; // Transfer doesn't exist
+  
+  // Now do the actual work with minimal lock time
+  FLock.Enter;
+  try
+    // Re-get transfer (might have changed)
+    if FTransfers.TryGetValue(ATransferID, Transfer) then
+    begin
+      // Transfer exists - add chunk
+      if (AChunkIndex < Transfer.TotalChunks) and (not Transfer.ChunkReceived[AChunkIndex]) then
+      begin
+        // Optimize: Calculate offset once and copy directly
+        ChunkOffset := AChunkIndex * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
+        Move(AChunkData[0], Transfer.CompleteData[ChunkOffset], DataSize);
+        
+        // Update tracking efficiently
+        Transfer.ChunkReceived[AChunkIndex] := True;
+        Inc(Transfer.ReceivedChunks);
+        Transfer.LastActivity := System.SysUtils.Now;
+        
+        // Update the transfer back to dictionary
+        FTransfers.AddOrSetValue(ATransferID, Transfer);
+        Result := True;
+      end;
+    end;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TChunkManager.CompleteTransfer(ATransferID: UInt32; out ACmd: Integer; out AFlags: Byte; 
+  out ASequence: UInt16; out ACompleteData: TBytes): Boolean;
+var
+  Transfer: TChunkTransfer;
+  MaxChunkSize, EstimatedSize: Integer;
+begin
+  Result := False;
+  FLock.Enter;
+  try
+    if FTransfers.TryGetValue(ATransferID, Transfer) and (Transfer.ReceivedChunks = Transfer.TotalChunks) then
+    begin
+      // All chunks received - prepare output
+      ACmd := Transfer.OriginalCmd;
+      AFlags := Transfer.OriginalFlags;
+      ASequence := Transfer.OriginalSequence;
+      
+      // Optimize: Estimate actual size (most chunks full size, last might be smaller)
+      MaxChunkSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
+      EstimatedSize := Transfer.TotalChunks * MaxChunkSize;
+      
+      // Use the pre-allocated buffer size but trim conservatively
+      if EstimatedSize <= Length(Transfer.CompleteData) then
+      begin
+        SetLength(ACompleteData, EstimatedSize);
+        Move(Transfer.CompleteData[0], ACompleteData[0], EstimatedSize);
+      end
+      else
+      begin
+        // Fallback: use the entire allocated buffer
+        ACompleteData := Copy(Transfer.CompleteData);
+      end;
+      
+      // Remove completed transfer
+      FTransfers.Remove(ATransferID);
+      Result := True;
+    end;
+  finally
+    FLock.Leave;
+  end;
 end;
 
 { TncCustomUDPServer }
@@ -1175,36 +1541,87 @@ end;
 
 procedure TncCustomUDPServer.SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
+  HeaderSize, DataSize, TotalSize: Integer;
+
+  // For normal sending
   Packet: TBytes;
   PacketHeader: TUdpCommandPacket;
-  HeaderSize: Integer;
-  DataSize: Integer;
+
+  // For chunking
+  ChunkHeader: TUdpChunkHeader;
+  ChunkPacket: TBytes;
+  TransferID: UInt32;
+  TotalChunks: UInt16;
+  ChunkIndex: UInt16;
+  CurrentPos: Integer;
+  ChunkDataSize: Integer;
+  MaxChunkDataSize: Integer;
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
 
-  // Build command packet header
-  PacketHeader.Magic := UDP_COMMAND_MAGIC;
-  PacketHeader.Header.Cmd := aCmd;
-  PacketHeader.Header.Flags := aFlags;
-  PacketHeader.Header.Sequence := aSequence;
-
-  // Calculate sizes
+  // Calculate total command packet size
   HeaderSize := SizeOf(TUdpCommandPacket);
   DataSize := Length(aData);
+  TotalSize := HeaderSize + DataSize;
 
-  // Allocate packet buffer
-  SetLength(Packet, HeaderSize + DataSize);
+  // Check if auto-chunking is needed
+  if TotalSize <= UDP_MAX_SAFE_PAYLOAD then
+  begin
+    // ===============================================
+    // NORMAL SEND - Single packet
+    // ===============================================
+    PacketHeader.Magic := UDP_COMMAND_MAGIC;
+    PacketHeader.Header.Cmd := aCmd;
+    PacketHeader.Header.Flags := aFlags;
+    PacketHeader.Header.Sequence := aSequence;
 
-  // Copy header to packet
-  Move(PacketHeader, Packet[0], HeaderSize);
+    SetLength(Packet, TotalSize);
+    Move(PacketHeader, Packet[0], HeaderSize);
+    if DataSize > 0 then
+      Move(aData[0], Packet[HeaderSize], DataSize);
 
-  // Copy data to packet (if any)
-  if DataSize > 0 then
-    Move(aData[0], Packet[HeaderSize], DataSize);
+    SendTo(Packet, DestAddr);
+  end
+  else
+  begin
+    // ===============================================
+    // AUTO-CHUNKING - Multiple packets
+    // ===============================================
+    MaxChunkDataSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
+    TotalChunks := (DataSize + MaxChunkDataSize - 1) div MaxChunkDataSize;
+    TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks);
 
-  // Send the command packet
-  SendTo(Packet, DestAddr);
+    CurrentPos := 0;
+    for ChunkIndex := 0 to TotalChunks - 1 do
+    begin
+      // Calculate chunk data size
+      ChunkDataSize := Min(MaxChunkDataSize, DataSize - CurrentPos);
+
+      // Build chunk header
+      ChunkHeader.Magic := UDP_CHUNK_MAGIC;
+      ChunkHeader.TransferID := TransferID;
+      ChunkHeader.ChunkIndex := ChunkIndex;
+      ChunkHeader.TotalChunks := TotalChunks;
+      ChunkHeader.OriginalCmd := aCmd;
+      ChunkHeader.OriginalFlags := aFlags;
+      ChunkHeader.OriginalSequence := aSequence;
+
+      // Build chunk packet
+      SetLength(ChunkPacket, SizeOf(TUdpChunkHeader) + ChunkDataSize);
+      Move(ChunkHeader, ChunkPacket[0], SizeOf(TUdpChunkHeader));
+      if ChunkDataSize > 0 then
+        Move(aData[CurrentPos], ChunkPacket[SizeOf(TUdpChunkHeader)], ChunkDataSize);
+
+      // Send chunk
+      SendTo(ChunkPacket, DestAddr);
+
+      Inc(CurrentPos, ChunkDataSize);
+
+      // Yield thread to prevent UDP buffer overflow while maintaining speed
+      Sleep(1);  // 1ms delay between chunks for reliable delivery
+    end;
+  end;
 end;
 
 procedure TncCustomUDPServer.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
@@ -1347,6 +1764,14 @@ var
   CommandHeader: TUdpCommandHeader;
   CommandData: TBytes;
   PacketSize: Integer;
+
+  // For chunk handling
+  ChunkHeader: TUdpChunkHeader;
+  ChunkData: TBytes;
+  CompleteCmd: Integer;
+  CompleteFlags: Byte;
+  CompleteSequence: UInt16;
+  CompleteData: TBytes;
 begin
   SenderAddrLen := SizeOf(TSockAddrStorage);
   FillChar(SenderAddr, SenderAddrLen, 0);
@@ -1360,43 +1785,93 @@ begin
 
   if BufRead > 0 then
   begin
-    // Check if this might be a command packet
-    if (BufRead >= SizeOf(TUdpCommandPacket)) then
+    // Check minimum size for any structured packet
+    if (BufRead >= SizeOf(UInt16)) then
     begin
-      // Extract magic number to check protocol
+      // Extract magic number to check protocol type
       Move(FServerSocket.ReadBuf[0], Magic, SizeOf(Magic));
-      
+
       if Magic = UDP_COMMAND_MAGIC then
       begin
-        // It's a command packet - extract command header
-        Move(FServerSocket.ReadBuf[SizeOf(UInt16)], CommandHeader, SizeOf(CommandHeader));
-        
-        // Extract command data (if any)
-        PacketSize := SizeOf(TUdpCommandPacket);
-        if BufRead > PacketSize then
+        // ===============================================
+        // NORMAL COMMAND PACKET
+        // ===============================================
+        if BufRead >= SizeOf(TUdpCommandPacket) then
         begin
-          SetLength(CommandData, BufRead - PacketSize);
-          Move(FServerSocket.ReadBuf[PacketSize], CommandData[0], BufRead - PacketSize);
-        end
-        else
-          SetLength(CommandData, 0);
-        
-        // Fire OnCommand event
-        if Assigned(FServerSocket.OnCommand) then
-          try
-            FServerSocket.OnCommand(FServerSocket,
-              FServerSocket.Line,
-              SenderAddr,
-              CommandHeader.Cmd,
-              CommandData,
-              CommandHeader.Flags,
-              CommandHeader.Sequence);
-          except
+          Move(FServerSocket.ReadBuf[SizeOf(UInt16)], CommandHeader, SizeOf(CommandHeader));
+
+          PacketSize := SizeOf(TUdpCommandPacket);
+          if BufRead > PacketSize then
+          begin
+            SetLength(CommandData, BufRead - PacketSize);
+            Move(FServerSocket.ReadBuf[PacketSize], CommandData[0], BufRead - PacketSize);
+          end
+          else
+            SetLength(CommandData, 0);
+
+          if Assigned(FServerSocket.OnCommand) then
+            try
+              FServerSocket.OnCommand(FServerSocket,
+                FServerSocket.Line,
+                SenderAddr,
+                CommandHeader.Cmd,
+                CommandData,
+                CommandHeader.Flags,
+                CommandHeader.Sequence);
+            except
+            end;
+        end;
+      end
+      else if Magic = UDP_CHUNK_MAGIC then
+      begin
+        // ===============================================
+        // CHUNK PACKET - Auto-reassembly
+        // ===============================================
+
+        if BufRead >= SizeOf(TUdpChunkHeader) then
+        begin
+          Move(FServerSocket.ReadBuf[0], ChunkHeader, SizeOf(ChunkHeader));
+
+          // Extract chunk data
+          PacketSize := SizeOf(TUdpChunkHeader);
+          if BufRead > PacketSize then
+          begin
+            SetLength(ChunkData, BufRead - PacketSize);
+            Move(FServerSocket.ReadBuf[PacketSize], ChunkData[0], BufRead - PacketSize);
+          end
+          else
+            SetLength(ChunkData, 0);
+
+          // Ensure transfer exists (create if first chunk)
+          FServerSocket.FChunkManager.CreateTransferFromChunk(ChunkHeader.TransferID, ChunkHeader.TotalChunks,
+            ChunkHeader.OriginalCmd, ChunkHeader.OriginalFlags, ChunkHeader.OriginalSequence);
+
+          // Add chunk to manager
+          FServerSocket.FChunkManager.AddChunk(ChunkHeader.TransferID, ChunkHeader.ChunkIndex, ChunkData);
+
+          // Check if transfer is complete
+          if FServerSocket.FChunkManager.CompleteTransfer(ChunkHeader.TransferID, CompleteCmd, CompleteFlags, CompleteSequence, CompleteData) then
+          begin
+            // Transfer complete - fire OnCommand with reassembled data
+            if Assigned(FServerSocket.OnCommand) then
+              try
+                FServerSocket.OnCommand(FServerSocket,
+                  FServerSocket.Line,
+                  SenderAddr,
+                  CompleteCmd,
+                  CompleteData,
+                  CompleteFlags,
+                  CompleteSequence);
+              except
+              end;
           end;
+        end;
       end
       else
       begin
-        // Not a command packet - treat as raw data
+        // ===============================================
+        // RAW DATA PACKET
+        // ===============================================
         if Assigned(FServerSocket.OnReadDatagram) then
           try
             FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
@@ -1407,7 +1882,9 @@ begin
     end
     else
     begin
-      // Too small to be a command packet - treat as raw data
+      // ===============================================
+      // TOO SMALL - Raw data
+      // ===============================================
       if Assigned(FServerSocket.OnReadDatagram) then
         try
           FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
@@ -1451,4 +1928,5 @@ begin
 end;
 
 end.
+
 

@@ -186,6 +186,7 @@ TCP v4 / TCP v6 / UDP v4 / UDP v6 are now avaible.
 ### Demo Updates
 - Added new `SimpleThreadedSockets` demo
 - Added new `SimpleSockets_UDP` demo
+- Added new `SimpleSockets_UDP_ImageDisplay` demo
 - Added new `SimpleSockets_TLS` demo for TLS/SSL secure communications (basic raw sockets)
 - Added new `SimpleThreadedSockets_TLS` demo for TLS/SSL secure communications (raw threaded sockets)
 - Updated the `SimpleSockets` demo
