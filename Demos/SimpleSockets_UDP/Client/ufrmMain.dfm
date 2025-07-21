@@ -3,7 +3,7 @@ object Form1: TForm1
   Top = 0
   ActiveControl = edtDataToSend
   Caption = 'UDPClient'
-  ClientHeight = 243
+  ClientHeight = 275
   ClientWidth = 527
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
@@ -30,8 +30,6 @@ object Form1: TForm1
     ScrollBars = ssVertical
     TabOrder = 1
     OnKeyDown = memLogKeyDown
-    ExplicitWidth = 515
-    ExplicitHeight = 161
   end
   object pnlToolbar: TPanel
     Left = 0
@@ -42,7 +40,6 @@ object Form1: TForm1
     BevelOuter = bvNone
     FullRepaint = False
     TabOrder = 0
-    ExplicitWidth = 525
     object btnActivate: TButton
       AlignWithMargins = True
       Left = 5
@@ -70,7 +67,6 @@ object Form1: TForm1
       BevelOuter = bvNone
       FullRepaint = False
       TabOrder = 1
-      ExplicitWidth = 415
       object edtHost: TEdit
         AlignWithMargins = True
         Left = 5
@@ -85,7 +81,6 @@ object Form1: TForm1
         TabOrder = 0
         TextHint = 'Enter host address'
         OnChange = edtHostChange
-        ExplicitWidth = 279
       end
       object edtPort: TSpinEdit
         AlignWithMargins = True
@@ -103,7 +98,6 @@ object Form1: TForm1
         TabOrder = 1
         Value = 16233
         OnChange = edtPortChange
-        ExplicitLeft = 289
       end
     end
   end
@@ -120,8 +114,6 @@ object Form1: TForm1
     BevelOuter = bvNone
     FullRepaint = False
     TabOrder = 2
-    ExplicitTop = 203
-    ExplicitWidth = 525
     object btnSendData: TButton
       AlignWithMargins = True
       Left = 5
@@ -150,7 +142,6 @@ object Form1: TForm1
       BevelOuter = bvNone
       FullRepaint = False
       TabOrder = 1
-      ExplicitWidth = 415
       object edtDataToSend: TEdit
         AlignWithMargins = True
         Left = 5
@@ -167,13 +158,121 @@ object Form1: TForm1
         TextHint = 'Enter data to send here'
         OnEnter = edtDataToSendEnter
         OnExit = edtDataToSendExit
-        ExplicitWidth = 405
+      end
+    end
+  end
+  object Panel3: TPanel
+    Left = 0
+    Top = 243
+    Width = 527
+    Height = 32
+    Margins.Left = 5
+    Margins.Top = 0
+    Margins.Right = 5
+    Margins.Bottom = 5
+    Align = alBottom
+    BevelOuter = bvNone
+    FullRepaint = False
+    TabOrder = 3
+    object btnSendCommand: TButton
+      AlignWithMargins = True
+      Left = 5
+      Top = 0
+      Width = 105
+      Height = 27
+      Margins.Left = 5
+      Margins.Top = 0
+      Margins.Right = 0
+      Margins.Bottom = 5
+      Align = alLeft
+      Caption = 'Send Command'
+      TabOrder = 0
+      OnClick = btnSendCommandClick
+    end
+    object Panel4: TPanel
+      AlignWithMargins = True
+      Left = 110
+      Top = 3
+      Width = 80
+      Height = 26
+      Margins.Left = 0
+      Margins.Right = 0
+      Align = alLeft
+      BevelOuter = bvNone
+      FullRepaint = False
+      TabOrder = 1
+      object Label1: TLabel
+        AlignWithMargins = True
+        Left = 3
+        Top = 6
+        Width = 15
+        Height = 17
+        Margins.Top = 6
+        Align = alLeft
+        Caption = 'ID:'
+        ExplicitHeight = 13
+      end
+      object edtCommandID: TSpinEdit
+        AlignWithMargins = True
+        Left = 21
+        Top = 0
+        Width = 54
+        Height = 22
+        Margins.Left = 0
+        Margins.Top = 0
+        Margins.Right = 5
+        Margins.Bottom = 4
+        Align = alClient
+        MaxValue = 9999
+        MinValue = 0
+        TabOrder = 0
+        Value = 42
+      end
+    end
+    object Panel5: TPanel
+      AlignWithMargins = True
+      Left = 190
+      Top = 3
+      Width = 337
+      Height = 26
+      Margins.Left = 0
+      Margins.Right = 0
+      Align = alClient
+      BevelOuter = bvNone
+      FullRepaint = False
+      TabOrder = 2
+      object Label2: TLabel
+        AlignWithMargins = True
+        Left = 3
+        Top = 6
+        Width = 27
+        Height = 17
+        Margins.Top = 6
+        Align = alLeft
+        Caption = 'Data:'
+        ExplicitHeight = 13
+      end
+      object edtCommandData: TEdit
+        AlignWithMargins = True
+        Left = 33
+        Top = 0
+        Width = 299
+        Height = 21
+        Margins.Left = 0
+        Margins.Top = 0
+        Margins.Right = 5
+        Margins.Bottom = 5
+        Align = alClient
+        TabOrder = 0
+        Text = 'Hello Server!'
+        TextHint = 'Enter command data here'
       end
     end
   end
   object UDPClient: TncUDPClient
-    Family = afIPv6
+    Broadcast = True
     OnReadDatagram = UDPClientReadDatagram
+    OnCommand = UDPClientCommand
     Left = 216
     Top = 96
   end

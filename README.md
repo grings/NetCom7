@@ -95,11 +95,63 @@ The **TncServer** and **TncClient** components can be dragged from the palette a
 ![alt text](image-4.png) ![alt text](image-5.png)
 
 ### Enhanced UDP Support
+The **UDP** components now feature **dual protocol coexistence** similar to ncSocketsPro, allowing both raw data and structured commands on the same connection.
+
+#### 🎯 **Dual Protocol Support**
+**TncUDPClient** and **TncUDPServer** can handle both protocols simultaneously:
+- **Raw Data Packets**: Handled via `OnReadDatagram` event
+- **Command Packets**: Handled via `OnCommand` event  
+- **Automatic Detection**: Uses magic header (`$4E43` - 'NC') for intelligent packet routing
+
+#### 🚀 **Protocol Coexistence Architecture**
+```pascal
+UDP Packet → Protocol Detection → {
+  Raw Data → OnReadDatagram (any data format)
+  Commands → OnCommand (structured with ID, data, flags, sequence)
+}
+```
+
+#### 📡 **Easy API Usage**
+```pascal
+// Send raw data (traditional UDP)
+UDPClient.Send('Hello World');
+UDPServer.SendTo(ResponseData, ClientAddr);
+
+// Send structured commands (new!)
+UDPClient.SendCommand(42, BytesOf('Command Data'));
+UDPServer.SendCommand(ClientAddr, 100, ResponseData);
+
+// Broadcast commands to entire network
+UDPClient.Broadcast := True;
+UDPClient.SendCommand('192.168.1.255', 8080, 200, BroadcastData);
+```
+
+#### 🎭 **Event Handling**
+```pascal
+// Raw data packets (existing)
+procedure OnReadDatagram(Sender: TObject; aLine: TncLine; const aBuf: TBytes; 
+  aBufCount: Integer; const SenderAddr: TSockAddrStorage);
+
+// Command packets (new!)  
+procedure OnCommand(Sender: TObject; aLine: TncLine; const aSenderAddr: TSockAddrStorage;
+  aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
+```
+
+#### ✅ **Key Benefits**
+- **Backward Compatible**: Existing raw UDP code works unchanged
+- **Zero Overhead**: Raw packets have no processing overhead
+- **Network Efficient**: 9-byte command header (magic + cmd + flags + sequence)
+- **Broadcast Support**: Commands work with UDP broadcast functionality
+- **Cross-Platform**: IPv4/IPv6 support with automatic family detection
+
 The **UDP** components can be dragged from the palette and customized in the object inspector with the following properties:
 - Broadcast capabilities
 - Buffer size customization
+- Dual protocol events (OnReadDatagram + OnCommand)
 
 ![alt text](image-1.png)
+
+![alt text](image-11.png) ![alt text](image-12.png)
 
 ### 🔐 TLS/SSL Security Support
 NetCom7 now includes **TLS/SSL encryption** support for secure communications:

@@ -27,9 +27,13 @@ type
     procedure memLogKeyDown(Sender: TObject; var Key: Word; Shift: TShiftState);
     procedure edtPortChange(Sender: TObject);
     procedure SendToClient(const Data: string; const DestAddr: TSockAddrStorage);
+    procedure SendCommandToClient(aCmd: Integer; const Data: string; const DestAddr: TSockAddrStorage);
     procedure UDPServerReadDatagram(Sender: TObject; aLine: TncLine;
       const aBuf: TBytes; aBufCount: Integer;
       const SenderAddr: TSockAddrStorage);
+    procedure UDPServerCommand(Sender: TObject; aLine: TncLine;
+      const aSenderAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes;
+      aFlags: Byte; aSequence: UInt16);
   public
   end;
 
@@ -42,7 +46,7 @@ implementation
 
 procedure TForm1.FormCreate(Sender: TObject);
 begin
-//
+  // Server initialization if needed in future
 end;
 
 procedure TForm1.FormDestroy(Sender: TObject);
@@ -111,10 +115,44 @@ begin
     // Send the data - pass TSockAddrStorage directly
     UDPServer.SendTo(BytesOf(Data), DestAddr);
 
-    Form1.Log(Format('Sent to %s: %s', [SenderIP, Data]));
+    Log(Format('[RAW DATA] Sent to %s: %s', [SenderIP, Data]));
   except
     on E: Exception do
-      Form1.Log('Error sending data: ' + E.Message);
+      Log('Error sending data: ' + E.Message);
+  end;
+end;
+
+// *****************************************************************************
+// SendCommandToClient
+// *****************************************************************************
+procedure TForm1.SendCommandToClient(aCmd: Integer; const Data: string; const DestAddr: TSockAddrStorage);
+var
+  SenderIP: string;
+  CommandData: TBytes;
+begin
+  if not UDPServer.Active then
+    Exit;
+
+  try
+    // Get IP address using our utils
+    SenderIP := TncIPUtils.GetIPFromStorage(DestAddr);
+
+    // Convert data to bytes
+    if Data <> '' then
+      CommandData := BytesOf(Data)
+    else
+      SetLength(CommandData, 0);
+
+    // Send the command
+    UDPServer.SendCommand(DestAddr, aCmd, CommandData);
+
+    if Data <> '' then
+      Log(Format('[COMMAND] Sent to %s: ID=%d, Data=%s', [SenderIP, aCmd, Data]))
+    else
+      Log(Format('[COMMAND] Sent to %s: ID=%d (no data)', [SenderIP, aCmd]));
+  except
+    on E: Exception do
+      Log('Error sending command: ' + E.Message);
   end;
 end;
 
@@ -135,11 +173,55 @@ begin
     SenderIP := TncIPUtils.GetIPFromStorage(SenderAddr);
 
     // Log and echo
-    Form1.Log(Format('Received from %s: %s', [SenderIP, ReceivedData]));
+    Log(Format('[RAW DATA] Received from %s: %s', [SenderIP, ReceivedData]));
     SendToClient('Echo: ' + ReceivedData, SenderAddr);
   except
     on E: Exception do
-      Form1.Log(Format('Error processing datagram: %s', [E.Message]));
+      Log(Format('Error processing datagram: %s', [E.Message]));
+  end;
+end;
+
+// *****************************************************************************
+// Read Commands
+// *****************************************************************************
+procedure TForm1.UDPServerCommand(Sender: TObject; aLine: TncLine;
+  const aSenderAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes;
+  aFlags: Byte; aSequence: UInt16);
+var
+  SenderIP: string;
+  DataStr: string;
+begin
+  try
+    // Get sender IP address using our utils
+    SenderIP := TncIPUtils.GetIPFromStorage(aSenderAddr);
+
+    // Convert command data to string if present
+    if Length(aData) > 0 then
+      DataStr := StringOf(aData)
+    else
+      DataStr := '(no data)';
+
+    Log(Format('[COMMAND] Received from %s: ID=%d, Data=%s, Flags=%d, Seq=%d', 
+      [SenderIP, aCmd, DataStr, aFlags, aSequence]));
+
+    // Example command handling
+    case aCmd of
+      42: // Echo command
+        SendCommandToClient(100, 'Command Echo: ' + DataStr, aSenderAddr);
+      100: // Ping command
+        SendCommandToClient(101, 'Pong!', aSenderAddr);
+      999: // Shutdown command
+        begin
+          Log('Shutdown command received from ' + SenderIP);
+          SendCommandToClient(1000, 'Shutting down...', aSenderAddr);
+        end;
+    else
+      // Unknown command - reply with error
+      SendCommandToClient(9999, Format('Unknown command: %d', [aCmd]), aSenderAddr);
+    end;
+  except
+    on E: Exception do
+      Log(Format('Error processing command: %s', [E.Message]));
   end;
 end;
 
