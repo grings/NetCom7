@@ -601,17 +601,12 @@ begin
   PFXBlob.pbData := @PFXData[0];
   PasswordW := WideString(string(Password)); // Convert AnsiString to WideString
 
-  // Import with no flags to allow private key access (PKCS12_NO_PERSIST_KEY may prevent access)
+  // Import with no flags to allow full private key access for TLS operations
   CertStore := PFXImportCertStore(@PFXBlob, PWideChar(PasswordW), 0);
   if CertStore = nil then
   begin
-    // Fallback to original approach
-    CertStore := PFXImportCertStore(@PFXBlob, PWideChar(PasswordW), PKCS12_NO_PERSIST_KEY);
-    if CertStore = nil then
-    begin
-      // PFXImportCertStore failed with all approaches
-      Exit;
-    end;
+    // PFXImportCertStore failed
+    Exit;
   end;
 
   try
