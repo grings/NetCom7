@@ -42,15 +42,11 @@ const
   DefBroadcast = False;
   DefFamily = afIPv4;
 
-  // UDP Performance constants  
+  // UDP Performance constants - ENet Lightweight Optimizations (Core Only)
   UDP_COMMAND_MAGIC = $4E43; // 'NC'
   UDP_CHUNK_MAGIC = $4E44;   // 'ND' signature for chunk packets
-  UDP_MAX_SAFE_PAYLOAD = 1500; // Maximum bytes per UDP chunk (avoids fragmentation)
+  UDP_MAX_SAFE_PAYLOAD = 1392; // Optimal MTU (avoids fragmentation)
   UDP_CHUNK_TIMEOUT = 5000;    // 5 seconds timeout for incomplete transfers
-  UDP_BATCH_SIZE = 10;         // Send chunks in batches for optimal performance
-  UDP_MAX_BUFFER_CHECK = 3;    // Reduced retries for faster flow
-  UDP_BURST_SIZE = 8;          // Send packets in bursts for network saturation
-  UDP_BURST_DELAY_US = 10;     // Microsecond delay between bursts (if needed)
 
 type
   // UDP Command Header Structure
@@ -77,24 +73,30 @@ type
     OriginalFlags: Byte;  // Original command flags
     OriginalSequence: UInt16; // Original sequence number
   end;
-  
+
   // Pointer type for zero-copy operations
   PUdpChunkHeader = ^TUdpChunkHeader;
 
-  // Chunk reassembly tracking - OPTIMIZED
+  // Chunk reassembly tracking
   TChunkTransfer = record
     TransferID: UInt32;
     OriginalCmd: Integer;
     OriginalFlags: Byte;
     OriginalSequence: UInt16;
     TotalChunks: UInt16;
-    ReceivedChunks: UInt16;
+    FragmentsRemaining: UInt16;
     LastActivity: TDateTime;
-    CompleteData: TBytes;        // Pre-allocated full buffer
-    ChunkReceived: array of Boolean; // Track which chunks we have
+    CompleteData: TBytes;           // Pre-allocated full buffer  
+    Fragments: array of UInt32;    // Bitwise tracking
+    ActualDataSize: UInt32;        // Real size of the complete data (calculated when complete)
+    LastChunkSize: UInt16;         // Size of the last chunk (for accurate total calculation)
+    
+    // ENet-style helper methods for bitwise operations
+    function IsFragmentReceived(FragmentIndex: UInt16): Boolean;
+    procedure SetFragmentReceived(FragmentIndex: UInt16);
   end;
 
-  // Chunk transfer manager - OPTIMIZED
+  // Chunk transfer manager
   TChunkManager = class
   private
     FTransfers: TDictionary<UInt32, TChunkTransfer>; // Hash table for O(1) lookup
@@ -104,7 +106,7 @@ type
   public
     constructor Create;
     destructor Destroy; override;
-    function StartTransfer(ACmd: Integer; AFlags: Byte; ASequence: UInt16; ATotalChunks: UInt16): UInt32;
+    function StartTransfer(ACmd: Integer; AFlags: Byte; ASequence: UInt16; ATotalChunks: UInt16; AActualDataSize: UInt32): UInt32;
     function CreateTransferFromChunk(ATransferID: UInt32; ATotalChunks: UInt16; AOriginalCmd: Integer; AOriginalFlags: Byte; AOriginalSequence: UInt16): Boolean;
     function AddChunk(ATransferID: UInt32; AChunkIndex: UInt16; const AChunkData: TBytes): Boolean;
     function CompleteTransfer(ATransferID: UInt32; out ACmd: Integer; out AFlags: Byte;
@@ -756,10 +758,14 @@ var
   CurrentPos: Integer;
   ChunkDataSize: Integer;
   MaxChunkDataSize: Integer;
-  
+
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
+
+  // IPv6 broadcast validation
+  if (Family = afIPv6) and GetBroadcast then
+    raise Exception.Create('Broadcast is not supported in IPv6. Use multicast instead.');
 
   // Calculate total command packet size
   HeaderSize := SizeOf(TUdpCommandPacket);
@@ -843,9 +849,9 @@ begin
 
     MaxChunkDataSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
     TotalChunks := (DataSize + MaxChunkDataSize - 1) div MaxChunkDataSize;
-    TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks);
+    TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks, DataSize);
 
-    // PRE-BUILD ALL PACKETS
+    // Immediate packet sending for maximum speed
     SetLength(ChunkPacket, UDP_MAX_SAFE_PAYLOAD);
 
     ChunkHeader.Magic := UDP_CHUNK_MAGIC;
@@ -854,22 +860,24 @@ begin
     ChunkHeader.OriginalCmd := aCmd;
     ChunkHeader.OriginalFlags := aFlags;
     ChunkHeader.OriginalSequence := aSequence;
-    
+
     CurrentPos := 0;
 
+    // Send packets immediately without preparation overhead
     for ChunkIndex := 0 to TotalChunks - 1 do
     begin
-
       ChunkDataSize := MaxChunkDataSize;
       if ChunkIndex = TotalChunks - 1 then
         ChunkDataSize := DataSize - CurrentPos;
 
       ChunkHeader.ChunkIndex := ChunkIndex;
 
+      // Build and send packet immediately (zero overhead)
       Move(ChunkHeader, ChunkPacket[0], SizeOf(TUdpChunkHeader));
       if ChunkDataSize > 0 then
         Move(aData[CurrentPos], ChunkPacket[SizeOf(TUdpChunkHeader)], ChunkDataSize);
 
+      // Send immediately at maximum speed (no delays, no burst preparation)
       SendTo(ChunkPacket[0], SizeOf(TUdpChunkHeader) + ChunkDataSize, storage);
 
       Inc(CurrentPos, ChunkDataSize);
@@ -1231,10 +1239,11 @@ begin
     FTransfers.Remove(ExpiredIDs[I]);
 end;
 
-function TChunkManager.StartTransfer(ACmd: Integer; AFlags: Byte; ASequence: UInt16; ATotalChunks: UInt16): UInt32;
+function TChunkManager.StartTransfer(ACmd: Integer; AFlags: Byte; ASequence: UInt16; ATotalChunks: UInt16; AActualDataSize: UInt32): UInt32;
 var
   Transfer: TChunkTransfer;
   MaxDataSize: Integer;
+  BitArraySize: Integer;
 begin
   FLock.Enter;
   try
@@ -1245,13 +1254,21 @@ begin
     Transfer.OriginalFlags := AFlags;
     Transfer.OriginalSequence := ASequence;
     Transfer.TotalChunks := ATotalChunks;
-    Transfer.ReceivedChunks := 0;
+    Transfer.FragmentsRemaining := ATotalChunks; // Initialize FragmentsRemaining
     Transfer.LastActivity := System.SysUtils.Now;
+    Transfer.ActualDataSize := AActualDataSize; // Store the actual data size
+    Transfer.LastChunkSize := 0; // Will be set when last chunk is received
 
-    // Optimize: Pre-allocate only maximum needed size (not over-allocate)
+    // Pre-allocate only maximum needed size (not over-allocate)
     MaxDataSize := ATotalChunks * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
     SetLength(Transfer.CompleteData, MaxDataSize);
-    SetLength(Transfer.ChunkReceived, ATotalChunks);
+    
+    // Calculate bit array size (32 fragments per UInt32)
+    BitArraySize := (ATotalChunks + 31) div 32;
+    SetLength(Transfer.Fragments, BitArraySize);
+    // Initialize all bits to 0
+    if BitArraySize > 0 then
+      FillChar(Transfer.Fragments[0], BitArraySize * SizeOf(UInt32), 0);
 
     FTransfers.Add(Transfer.TransferID, Transfer);
 
@@ -1265,6 +1282,7 @@ function TChunkManager.CreateTransferFromChunk(ATransferID: UInt32; ATotalChunks
 var
   Transfer: TChunkTransfer;
   MaxDataSize: Integer;
+  BitArraySize: Integer;
 begin
   Result := False;
   FLock.Enter;
@@ -1282,13 +1300,21 @@ begin
     Transfer.OriginalFlags := AOriginalFlags;
     Transfer.OriginalSequence := AOriginalSequence;
     Transfer.TotalChunks := ATotalChunks;
-    Transfer.ReceivedChunks := 0;
+    Transfer.FragmentsRemaining := ATotalChunks; // Initialize FragmentsRemaining
     Transfer.LastActivity := System.SysUtils.Now;
+    Transfer.ActualDataSize := 0; // Will be calculated when all chunks received
+    Transfer.LastChunkSize := 0; // Will be set when last chunk is received
 
     // Pre-allocate buffer for maximum possible data size
     MaxDataSize := ATotalChunks * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
     SetLength(Transfer.CompleteData, MaxDataSize);
-    SetLength(Transfer.ChunkReceived, ATotalChunks);
+    
+    // Calculate bit array size (32 fragments per UInt32)
+    BitArraySize := (ATotalChunks + 31) div 32;
+    SetLength(Transfer.Fragments, BitArraySize);
+    // Initialize all bits to 0
+    if BitArraySize > 0 then
+      FillChar(Transfer.Fragments[0], BitArraySize * SizeOf(UInt32), 0);
 
     FTransfers.Add(Transfer.TransferID, Transfer);
 
@@ -1303,6 +1329,7 @@ var
   Transfer: TChunkTransfer;
   ChunkOffset: Integer;
   DataSize: Integer;
+  MaxChunkSize: Integer;
 begin
   Result := False;
   DataSize := Length(AChunkData);
@@ -1310,28 +1337,37 @@ begin
   // Quick validation before lock
   if DataSize = 0 then Exit;
 
-  // MAJOR OPTIMIZATION: Single lock operation only
+  // Single lock operation only
   FLock.Enter;
   try
     if FTransfers.TryGetValue(ATransferID, Transfer) then
     begin
       // Transfer exists - add chunk
-      if (AChunkIndex < Transfer.TotalChunks) and (not Transfer.ChunkReceived[AChunkIndex]) then
+      if (AChunkIndex < Transfer.TotalChunks) and (not Transfer.IsFragmentReceived(AChunkIndex)) then
       begin
-        // ULTRA-FAST: Calculate offset once and copy directly
-        ChunkOffset := AChunkIndex * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
-        
-        // ZERO-COPY: Direct memory operation
+        // Calculate offset once and copy directly
+        MaxChunkSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
+        ChunkOffset := AChunkIndex * MaxChunkSize;
+
+        // Direct memory operation
         if ChunkOffset + DataSize <= Length(Transfer.CompleteData) then
         begin
           Move(AChunkData[0], Transfer.CompleteData[ChunkOffset], DataSize);
 
-          // OPTIMIZED: Update tracking efficiently
-          Transfer.ChunkReceived[AChunkIndex] := True;
-          Inc(Transfer.ReceivedChunks);
+          // Update tracking
+          Transfer.SetFragmentReceived(AChunkIndex);
+          Dec(Transfer.FragmentsRemaining);
           Transfer.LastActivity := System.SysUtils.Now;
+          
+          // Track last chunk size for accurate total calculation
+          if AChunkIndex = Transfer.TotalChunks - 1 then
+            Transfer.LastChunkSize := DataSize;
+            
+          // If all chunks received, calculate actual data size
+          if Transfer.FragmentsRemaining = 0 then
+            Transfer.ActualDataSize := (Transfer.TotalChunks - 1) * MaxChunkSize + Transfer.LastChunkSize;
 
-          // SINGLE UPDATE: Update the transfer back to dictionary once
+          // Update the transfer back to dictionary once
           FTransfers.AddOrSetValue(ATransferID, Transfer);
           Result := True;
         end;
@@ -1346,26 +1382,25 @@ function TChunkManager.CompleteTransfer(ATransferID: UInt32; out ACmd: Integer; 
   out ASequence: UInt16; out ACompleteData: TBytes): Boolean;
 var
   Transfer: TChunkTransfer;
-  MaxChunkSize: Integer;
-  EstimatedSize: Integer;
 begin
   Result := False;
   FLock.Enter;
   try
-    if FTransfers.TryGetValue(ATransferID, Transfer) and (Transfer.ReceivedChunks = Transfer.TotalChunks) then
+    if FTransfers.TryGetValue(ATransferID, Transfer) and (Transfer.FragmentsRemaining = 0) then
     begin
       // All chunks received - prepare output
       ACmd := Transfer.OriginalCmd;
       AFlags := Transfer.OriginalFlags;
       ASequence := Transfer.OriginalSequence;
 
-      // ULTRA-FAST: Simple size calculation
-      MaxChunkSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
-      EstimatedSize := Transfer.TotalChunks * MaxChunkSize;
-
-      // ZERO-COPY: Direct assignment with optimized size
-      SetLength(ACompleteData, EstimatedSize);
-      Move(Transfer.CompleteData[0], ACompleteData[0], EstimatedSize);
+      // Use the stored actual data size (from sender)
+      if Transfer.ActualDataSize > 0 then
+      begin
+        SetLength(ACompleteData, Transfer.ActualDataSize);
+        Move(Transfer.CompleteData[0], ACompleteData[0], Transfer.ActualDataSize);
+      end
+      else
+        SetLength(ACompleteData, 0);
 
       // Remove completed transfer
       FTransfers.Remove(ATransferID);
@@ -1374,6 +1409,26 @@ begin
   finally
     FLock.Leave;
   end;
+end;
+
+{ TChunkTransfer - bitwise fragment tracking }
+
+function TChunkTransfer.IsFragmentReceived(FragmentIndex: UInt16): Boolean;
+begin
+  if FragmentIndex >= TotalChunks then
+  begin
+    Result := False;
+    Exit;
+  end;
+  // Bitwise check: (fragments[fragmentNumber / 32] & (1u << (fragmentNumber % 32))) == 0
+  Result := (Fragments[FragmentIndex div 32] and (UInt32(1) shl (FragmentIndex mod 32))) <> 0;
+end;
+
+procedure TChunkTransfer.SetFragmentReceived(FragmentIndex: UInt16);
+begin
+  if FragmentIndex < TotalChunks then
+    // Bitwise set: fragments[fragmentNumber / 32] |= (1u << (fragmentNumber % 32))
+    Fragments[FragmentIndex div 32] := Fragments[FragmentIndex div 32] or (UInt32(1) shl (FragmentIndex mod 32));
 end;
 
 { TncCustomUDPServer }
@@ -1549,7 +1604,7 @@ var
   CurrentPos: Integer;
   ChunkDataSize: Integer;
   MaxChunkDataSize: Integer;
-  
+
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
@@ -1585,9 +1640,9 @@ begin
 
     MaxChunkDataSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
     TotalChunks := (DataSize + MaxChunkDataSize - 1) div MaxChunkDataSize;
-    TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks);
+    TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks, DataSize);
 
-    // PRE-BUILD ALL PACKETS
+    // Immediate packet sending for maximum speed
     SetLength(ChunkPacket, UDP_MAX_SAFE_PAYLOAD);
 
     ChunkHeader.Magic := UDP_CHUNK_MAGIC;
@@ -1596,22 +1651,24 @@ begin
     ChunkHeader.OriginalCmd := aCmd;
     ChunkHeader.OriginalFlags := aFlags;
     ChunkHeader.OriginalSequence := aSequence;
-    
+
     CurrentPos := 0;
 
+    // Send packets immediately without preparation overhead
     for ChunkIndex := 0 to TotalChunks - 1 do
     begin
-
       ChunkDataSize := MaxChunkDataSize;
       if ChunkIndex = TotalChunks - 1 then
         ChunkDataSize := DataSize - CurrentPos;
 
       ChunkHeader.ChunkIndex := ChunkIndex;
 
+      // Build and send packet immediately (zero overhead)
       Move(ChunkHeader, ChunkPacket[0], SizeOf(TUdpChunkHeader));
       if ChunkDataSize > 0 then
         Move(aData[CurrentPos], ChunkPacket[SizeOf(TUdpChunkHeader)], ChunkDataSize);
 
+      // Send immediately at maximum speed (no delays, no burst preparation)
       SendTo(ChunkPacket[0], SizeOf(TUdpChunkHeader) + ChunkDataSize, DestAddr);
 
       Inc(CurrentPos, ChunkDataSize);
@@ -1625,6 +1682,10 @@ var
   addrV4: PSockAddrIn;
   addrV6: PSockAddrIn6;
 begin
+  // IPv6 broadcast validation
+  if (Family = afIPv6) and Broadcast then
+    raise Exception.Create('Broadcast is not supported in IPv6. Use multicast instead.');
+
   // Build destination address based on family
   case Family of
     afIPv4:
@@ -1926,6 +1987,7 @@ begin
 end;
 
 end.
+
 
 
 
