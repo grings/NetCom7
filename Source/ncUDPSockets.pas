@@ -42,7 +42,7 @@ const
   DefBroadcast = False;
   DefFamily = afIPv4;
 
-  // UDP Performance constants - ENet Lightweight Optimizations (Core Only)
+  // UDP Performance constants
   UDP_COMMAND_MAGIC = $4E43; // 'NC'
   UDP_CHUNK_MAGIC = $4E44;   // 'ND' signature for chunk packets
   UDP_MAX_SAFE_PAYLOAD = 1392; // Optimal MTU (avoids fragmentation)
