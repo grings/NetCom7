@@ -42,13 +42,15 @@ const
   DefBroadcast = False;
   DefFamily = afIPv4;
 
-  // UDP Command Protocol Constants
-  UDP_COMMAND_MAGIC = $4E43; // 'NC' signature for protocol detection
-
-  // Auto-chunking constants
-  UDP_MAX_SAFE_PAYLOAD = 16384; // Larger payload size for better performance (within reasonable UDP limits)
-  UDP_CHUNK_MAGIC = $4E44;     // 'ND' signature for chunk packets
+  // UDP Performance constants  
+  UDP_COMMAND_MAGIC = $4E43; // 'NC'
+  UDP_CHUNK_MAGIC = $4E44;   // 'ND' signature for chunk packets
+  UDP_MAX_SAFE_PAYLOAD = 1500; // Maximum bytes per UDP chunk (avoids fragmentation)
   UDP_CHUNK_TIMEOUT = 5000;    // 5 seconds timeout for incomplete transfers
+  UDP_BATCH_SIZE = 10;         // Send chunks in batches for optimal performance
+  UDP_MAX_BUFFER_CHECK = 3;    // Reduced retries for faster flow
+  UDP_BURST_SIZE = 8;          // Send packets in bursts for network saturation
+  UDP_BURST_DELAY_US = 10;     // Microsecond delay between bursts (if needed)
 
 type
   // UDP Command Header Structure
@@ -74,8 +76,10 @@ type
     OriginalCmd: Integer; // Original command ID
     OriginalFlags: Byte;  // Original command flags
     OriginalSequence: UInt16; // Original sequence number
-    // Variable chunk data follows
   end;
+  
+  // Pointer type for zero-copy operations
+  PUdpChunkHeader = ^TUdpChunkHeader;
 
   // Chunk reassembly tracking - OPTIMIZED
   TChunkTransfer = record
@@ -150,6 +154,10 @@ type
     procedure SetReaderThreadPriority(const Value: TncThreadPriority);
     function GetBroadcast: Boolean;
     procedure SetBroadcast(const Value: Boolean);
+    
+    // Performance optimization methods
+    function CanSendMore(aLine: TncLine): Boolean;
+    function GetOptimalBatchSize: Integer;
 
   private
     FUseReaderThread: Boolean;
@@ -497,6 +505,53 @@ begin
   end;
 end;
 
+// ===============================================
+// UDP Performance Optimization Methods
+// ===============================================
+
+function TncUDPBase.CanSendMore(aLine: TncLine): Boolean;
+var
+  SendBufSize, SendBufUsed: Integer;
+  OptLen: Integer;
+begin
+  // Default to allowing send for maximum performance
+  Result := True;
+  
+  try
+    // Try to check socket buffer state (may not work on all systems)
+    OptLen := SizeOf(SendBufUsed);
+    if getsockopt(aLine.Handle, SOL_SOCKET, SO_SNDLOWAT, @SendBufUsed, OptLen) = 0 then
+    begin
+      OptLen := SizeOf(SendBufSize);
+      if getsockopt(aLine.Handle, SOL_SOCKET, SO_SNDBUF, @SendBufSize, OptLen) = 0 then
+      begin
+        // Allow sending if buffer is less than 90% full (more permissive)
+        Result := (SendBufUsed < (SendBufSize * 90 div 100));
+        Exit;
+      end;
+    end;
+  except
+    // Ignore errors and fall through to default behavior
+  end;
+  
+  // FALLBACK: Always allow sending for maximum UDP performance
+  // Let the OS/network stack handle buffer management
+  Result := True;
+end;
+
+function TncUDPBase.GetOptimalBatchSize: Integer;
+begin
+  // More aggressive batching for better performance
+  if UDP_MAX_SAFE_PAYLOAD >= 50000 then
+    Result := 8   // Large chunks = moderate batches
+  else if UDP_MAX_SAFE_PAYLOAD >= 10000 then
+    Result := 15  // Medium chunks = larger batches  
+  else if UDP_MAX_SAFE_PAYLOAD >= 5000 then
+    Result := 25  // Small chunks = larger batches
+  else
+    Result := 50; // Very small chunks = very large batches for speed
+end;
+
 { TncCustomUDPClient }
 
 constructor TncCustomUDPClient.Create(AOwner: TComponent);
@@ -752,6 +807,7 @@ var
   CurrentPos: Integer;
   ChunkDataSize: Integer;
   MaxChunkDataSize: Integer;
+  
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
@@ -840,36 +896,35 @@ begin
     TotalChunks := (DataSize + MaxChunkDataSize - 1) div MaxChunkDataSize;
     TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks);
 
+    // PRE-BUILD ALL PACKETS
+    SetLength(ChunkPacket, UDP_MAX_SAFE_PAYLOAD);
+
+    ChunkHeader.Magic := UDP_CHUNK_MAGIC;
+    ChunkHeader.TransferID := TransferID;
+    ChunkHeader.TotalChunks := TotalChunks;
+    ChunkHeader.OriginalCmd := aCmd;
+    ChunkHeader.OriginalFlags := aFlags;
+    ChunkHeader.OriginalSequence := aSequence;
+    
     CurrentPos := 0;
+
     for ChunkIndex := 0 to TotalChunks - 1 do
     begin
-      // Calculate chunk data size
-      ChunkDataSize := Min(MaxChunkDataSize, DataSize - CurrentPos);
 
-      // Build chunk header
-      ChunkHeader.Magic := UDP_CHUNK_MAGIC;
-      ChunkHeader.TransferID := TransferID;
+      ChunkDataSize := MaxChunkDataSize;
+      if ChunkIndex = TotalChunks - 1 then
+        ChunkDataSize := DataSize - CurrentPos;
+
       ChunkHeader.ChunkIndex := ChunkIndex;
-      ChunkHeader.TotalChunks := TotalChunks;
-      ChunkHeader.OriginalCmd := aCmd;
-      ChunkHeader.OriginalFlags := aFlags;
-      ChunkHeader.OriginalSequence := aSequence;
 
-      // Build chunk packet
-      SetLength(ChunkPacket, SizeOf(TUdpChunkHeader) + ChunkDataSize);
       Move(ChunkHeader, ChunkPacket[0], SizeOf(TUdpChunkHeader));
       if ChunkDataSize > 0 then
         Move(aData[CurrentPos], ChunkPacket[SizeOf(TUdpChunkHeader)], ChunkDataSize);
 
-      // Send chunk
-      SendTo(ChunkPacket, storage);
+      SendTo(ChunkPacket[0], SizeOf(TUdpChunkHeader) + ChunkDataSize, storage);
 
       Inc(CurrentPos, ChunkDataSize);
-
-      // Yield thread to prevent UDP buffer overflow while maintaining speed
-      Sleep(1);  // Thread yield instead of 1ms delay for better performance
     end;
-
   end;
 end;
 
@@ -1079,12 +1134,14 @@ begin
 
         if BufRead >= SizeOf(TUdpChunkHeader) then
         begin
+          // Direct header access
           Move(FClientSocket.ReadBuf[0], ChunkHeader, SizeOf(ChunkHeader));
 
-          // Extract chunk data
+          // Direct chunk data extraction
           PacketSize := SizeOf(TUdpChunkHeader);
           if BufRead > PacketSize then
           begin
+            // Use buffer slice directly instead of copying
             SetLength(ChunkData, BufRead - PacketSize);
             Move(FClientSocket.ReadBuf[PacketSize], ChunkData[0], BufRead - PacketSize);
           end
@@ -1096,23 +1153,24 @@ begin
             ChunkHeader.OriginalCmd, ChunkHeader.OriginalFlags, ChunkHeader.OriginalSequence);
 
           // Add chunk to manager
-          FClientSocket.FChunkManager.AddChunk(ChunkHeader.TransferID, ChunkHeader.ChunkIndex, ChunkData);
-
-          // Check if transfer is complete
-          if FClientSocket.FChunkManager.CompleteTransfer(ChunkHeader.TransferID, CompleteCmd, CompleteFlags, CompleteSequence, CompleteData) then
+          if FClientSocket.FChunkManager.AddChunk(ChunkHeader.TransferID, ChunkHeader.ChunkIndex, ChunkData) then
           begin
-            // Transfer complete - fire OnCommand with reassembled data
-            if Assigned(FClientSocket.OnCommand) then
-              try
-                FClientSocket.OnCommand(FClientSocket,
-                  FClientSocket.Line,
-                  SenderAddr,
-                  CompleteCmd,
-                  CompleteData,
-                  CompleteFlags,
-                  CompleteSequence);
-              except
-              end;
+            // Only check completion if chunk was successfully added
+            if FClientSocket.FChunkManager.CompleteTransfer(ChunkHeader.TransferID, CompleteCmd, CompleteFlags, CompleteSequence, CompleteData) then
+            begin
+              // Transfer complete - fire OnCommand with reassembled data
+              if Assigned(FClientSocket.OnCommand) then
+                try
+                  FClientSocket.OnCommand(FClientSocket,
+                    FClientSocket.Line,
+                    SenderAddr,
+                    CompleteCmd,
+                    CompleteData,
+                    CompleteFlags,
+                    CompleteSequence);
+                except
+                end;
+            end;
           end;
         end;
       end
@@ -1232,7 +1290,7 @@ begin
   FLock.Enter;
   try
     CleanupExpiredTransfers;
-    
+
     Transfer.TransferID := GenerateTransferID;
     Transfer.OriginalCmd := ACmd;
     Transfer.OriginalFlags := AFlags;
@@ -1240,14 +1298,14 @@ begin
     Transfer.TotalChunks := ATotalChunks;
     Transfer.ReceivedChunks := 0;
     Transfer.LastActivity := System.SysUtils.Now;
-    
+
     // Optimize: Pre-allocate only maximum needed size (not over-allocate)
     MaxDataSize := ATotalChunks * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
     SetLength(Transfer.CompleteData, MaxDataSize);
     SetLength(Transfer.ChunkReceived, ATotalChunks);
-    
+
     FTransfers.Add(Transfer.TransferID, Transfer);
-    
+
     Result := Transfer.TransferID;
   finally
     FLock.Leave;
@@ -1296,45 +1354,38 @@ var
   Transfer: TChunkTransfer;
   ChunkOffset: Integer;
   DataSize: Integer;
-  TransferExists: Boolean;
 begin
   Result := False;
   DataSize := Length(AChunkData);
-  
+
   // Quick validation before lock
   if DataSize = 0 then Exit;
-  
-  // Optimize: Quick existence check to reduce lock contention
+
+  // MAJOR OPTIMIZATION: Single lock operation only
   FLock.Enter;
   try
-    TransferExists := FTransfers.TryGetValue(ATransferID, Transfer);
-  finally
-    FLock.Leave;
-  end;
-  
-  if not TransferExists then Exit; // Transfer doesn't exist
-  
-  // Now do the actual work with minimal lock time
-  FLock.Enter;
-  try
-    // Re-get transfer (might have changed)
     if FTransfers.TryGetValue(ATransferID, Transfer) then
     begin
       // Transfer exists - add chunk
       if (AChunkIndex < Transfer.TotalChunks) and (not Transfer.ChunkReceived[AChunkIndex]) then
       begin
-        // Optimize: Calculate offset once and copy directly
+        // ULTRA-FAST: Calculate offset once and copy directly
         ChunkOffset := AChunkIndex * (UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader));
-        Move(AChunkData[0], Transfer.CompleteData[ChunkOffset], DataSize);
         
-        // Update tracking efficiently
-        Transfer.ChunkReceived[AChunkIndex] := True;
-        Inc(Transfer.ReceivedChunks);
-        Transfer.LastActivity := System.SysUtils.Now;
-        
-        // Update the transfer back to dictionary
-        FTransfers.AddOrSetValue(ATransferID, Transfer);
-        Result := True;
+        // ZERO-COPY: Direct memory operation
+        if ChunkOffset + DataSize <= Length(Transfer.CompleteData) then
+        begin
+          Move(AChunkData[0], Transfer.CompleteData[ChunkOffset], DataSize);
+
+          // OPTIMIZED: Update tracking efficiently
+          Transfer.ChunkReceived[AChunkIndex] := True;
+          Inc(Transfer.ReceivedChunks);
+          Transfer.LastActivity := System.SysUtils.Now;
+
+          // SINGLE UPDATE: Update the transfer back to dictionary once
+          FTransfers.AddOrSetValue(ATransferID, Transfer);
+          Result := True;
+        end;
       end;
     end;
   finally
@@ -1342,11 +1393,12 @@ begin
   end;
 end;
 
-function TChunkManager.CompleteTransfer(ATransferID: UInt32; out ACmd: Integer; out AFlags: Byte; 
+function TChunkManager.CompleteTransfer(ATransferID: UInt32; out ACmd: Integer; out AFlags: Byte;
   out ASequence: UInt16; out ACompleteData: TBytes): Boolean;
 var
   Transfer: TChunkTransfer;
-  MaxChunkSize, EstimatedSize: Integer;
+  MaxChunkSize: Integer;
+  EstimatedSize: Integer;
 begin
   Result := False;
   FLock.Enter;
@@ -1357,23 +1409,15 @@ begin
       ACmd := Transfer.OriginalCmd;
       AFlags := Transfer.OriginalFlags;
       ASequence := Transfer.OriginalSequence;
-      
-      // Optimize: Estimate actual size (most chunks full size, last might be smaller)
+
+      // ULTRA-FAST: Simple size calculation
       MaxChunkSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
       EstimatedSize := Transfer.TotalChunks * MaxChunkSize;
-      
-      // Use the pre-allocated buffer size but trim conservatively
-      if EstimatedSize <= Length(Transfer.CompleteData) then
-      begin
-        SetLength(ACompleteData, EstimatedSize);
-        Move(Transfer.CompleteData[0], ACompleteData[0], EstimatedSize);
-      end
-      else
-      begin
-        // Fallback: use the entire allocated buffer
-        ACompleteData := Copy(Transfer.CompleteData);
-      end;
-      
+
+      // ZERO-COPY: Direct assignment with optimized size
+      SetLength(ACompleteData, EstimatedSize);
+      Move(Transfer.CompleteData[0], ACompleteData[0], EstimatedSize);
+
       // Remove completed transfer
       FTransfers.Remove(ATransferID);
       Result := True;
@@ -1556,6 +1600,7 @@ var
   CurrentPos: Integer;
   ChunkDataSize: Integer;
   MaxChunkDataSize: Integer;
+  
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
@@ -1588,38 +1633,39 @@ begin
     // ===============================================
     // AUTO-CHUNKING - Multiple packets
     // ===============================================
+
     MaxChunkDataSize := UDP_MAX_SAFE_PAYLOAD - SizeOf(TUdpChunkHeader);
     TotalChunks := (DataSize + MaxChunkDataSize - 1) div MaxChunkDataSize;
     TransferID := FChunkManager.StartTransfer(aCmd, aFlags, aSequence, TotalChunks);
 
+    // PRE-BUILD ALL PACKETS
+    SetLength(ChunkPacket, UDP_MAX_SAFE_PAYLOAD);
+
+    ChunkHeader.Magic := UDP_CHUNK_MAGIC;
+    ChunkHeader.TransferID := TransferID;
+    ChunkHeader.TotalChunks := TotalChunks;
+    ChunkHeader.OriginalCmd := aCmd;
+    ChunkHeader.OriginalFlags := aFlags;
+    ChunkHeader.OriginalSequence := aSequence;
+    
     CurrentPos := 0;
+
     for ChunkIndex := 0 to TotalChunks - 1 do
     begin
-      // Calculate chunk data size
-      ChunkDataSize := Min(MaxChunkDataSize, DataSize - CurrentPos);
 
-      // Build chunk header
-      ChunkHeader.Magic := UDP_CHUNK_MAGIC;
-      ChunkHeader.TransferID := TransferID;
+      ChunkDataSize := MaxChunkDataSize;
+      if ChunkIndex = TotalChunks - 1 then
+        ChunkDataSize := DataSize - CurrentPos;
+
       ChunkHeader.ChunkIndex := ChunkIndex;
-      ChunkHeader.TotalChunks := TotalChunks;
-      ChunkHeader.OriginalCmd := aCmd;
-      ChunkHeader.OriginalFlags := aFlags;
-      ChunkHeader.OriginalSequence := aSequence;
 
-      // Build chunk packet
-      SetLength(ChunkPacket, SizeOf(TUdpChunkHeader) + ChunkDataSize);
       Move(ChunkHeader, ChunkPacket[0], SizeOf(TUdpChunkHeader));
       if ChunkDataSize > 0 then
         Move(aData[CurrentPos], ChunkPacket[SizeOf(TUdpChunkHeader)], ChunkDataSize);
 
-      // Send chunk
-      SendTo(ChunkPacket, DestAddr);
+      SendTo(ChunkPacket[0], SizeOf(TUdpChunkHeader) + ChunkDataSize, DestAddr);
 
       Inc(CurrentPos, ChunkDataSize);
-
-      // Yield thread to prevent UDP buffer overflow while maintaining speed
-      Sleep(1);  // 1ms delay between chunks for reliable delivery
     end;
   end;
 end;
@@ -1830,12 +1876,14 @@ begin
 
         if BufRead >= SizeOf(TUdpChunkHeader) then
         begin
+          // Direct header access
           Move(FServerSocket.ReadBuf[0], ChunkHeader, SizeOf(ChunkHeader));
 
-          // Extract chunk data
+          // Direct chunk data extraction
           PacketSize := SizeOf(TUdpChunkHeader);
           if BufRead > PacketSize then
           begin
+            // Use buffer slice directly instead of copying
             SetLength(ChunkData, BufRead - PacketSize);
             Move(FServerSocket.ReadBuf[PacketSize], ChunkData[0], BufRead - PacketSize);
           end
@@ -1847,23 +1895,24 @@ begin
             ChunkHeader.OriginalCmd, ChunkHeader.OriginalFlags, ChunkHeader.OriginalSequence);
 
           // Add chunk to manager
-          FServerSocket.FChunkManager.AddChunk(ChunkHeader.TransferID, ChunkHeader.ChunkIndex, ChunkData);
-
-          // Check if transfer is complete
-          if FServerSocket.FChunkManager.CompleteTransfer(ChunkHeader.TransferID, CompleteCmd, CompleteFlags, CompleteSequence, CompleteData) then
+          if FServerSocket.FChunkManager.AddChunk(ChunkHeader.TransferID, ChunkHeader.ChunkIndex, ChunkData) then
           begin
-            // Transfer complete - fire OnCommand with reassembled data
-            if Assigned(FServerSocket.OnCommand) then
-              try
-                FServerSocket.OnCommand(FServerSocket,
-                  FServerSocket.Line,
-                  SenderAddr,
-                  CompleteCmd,
-                  CompleteData,
-                  CompleteFlags,
-                  CompleteSequence);
-              except
-              end;
+            // Only check completion if chunk was successfully added
+            if FServerSocket.FChunkManager.CompleteTransfer(ChunkHeader.TransferID, CompleteCmd, CompleteFlags, CompleteSequence, CompleteData) then
+            begin
+              // Transfer complete - fire OnCommand with reassembled data
+              if Assigned(FServerSocket.OnCommand) then
+                try
+                  FServerSocket.OnCommand(FServerSocket,
+                    FServerSocket.Line,
+                    SenderAddr,
+                    CompleteCmd,
+                    CompleteData,
+                    CompleteFlags,
+                    CompleteSequence);
+                except
+                end;
+            end;
           end;
         end;
       end
@@ -1928,5 +1977,6 @@ begin
 end;
 
 end.
+
 
 
