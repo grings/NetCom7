@@ -90,8 +90,8 @@ type
     Fragments: array of UInt32;    // Bitwise tracking
     ActualDataSize: UInt32;        // Real size of the complete data (calculated when complete)
     LastChunkSize: UInt16;         // Size of the last chunk (for accurate total calculation)
-    
-    // ENet-style helper methods for bitwise operations
+
+    // Helper methods for bitwise operations
     function IsFragmentReceived(FragmentIndex: UInt16): Boolean;
     procedure SetFragmentReceived(FragmentIndex: UInt16);
   end;
