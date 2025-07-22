@@ -154,10 +154,6 @@ type
     procedure SetReaderThreadPriority(const Value: TncThreadPriority);
     function GetBroadcast: Boolean;
     procedure SetBroadcast(const Value: Boolean);
-    
-    // Performance optimization methods
-    function CanSendMore(aLine: TncLine): Boolean;
-    function GetOptimalBatchSize: Integer;
 
   private
     FUseReaderThread: Boolean;
@@ -503,53 +499,6 @@ begin
   finally
     PropertyLock.Release;
   end;
-end;
-
-// ===============================================
-// UDP Performance Optimization Methods
-// ===============================================
-
-function TncUDPBase.CanSendMore(aLine: TncLine): Boolean;
-var
-  SendBufSize, SendBufUsed: Integer;
-  OptLen: Integer;
-begin
-  // Default to allowing send for maximum performance
-  Result := True;
-  
-  try
-    // Try to check socket buffer state (may not work on all systems)
-    OptLen := SizeOf(SendBufUsed);
-    if getsockopt(aLine.Handle, SOL_SOCKET, SO_SNDLOWAT, @SendBufUsed, OptLen) = 0 then
-    begin
-      OptLen := SizeOf(SendBufSize);
-      if getsockopt(aLine.Handle, SOL_SOCKET, SO_SNDBUF, @SendBufSize, OptLen) = 0 then
-      begin
-        // Allow sending if buffer is less than 90% full (more permissive)
-        Result := (SendBufUsed < (SendBufSize * 90 div 100));
-        Exit;
-      end;
-    end;
-  except
-    // Ignore errors and fall through to default behavior
-  end;
-  
-  // FALLBACK: Always allow sending for maximum UDP performance
-  // Let the OS/network stack handle buffer management
-  Result := True;
-end;
-
-function TncUDPBase.GetOptimalBatchSize: Integer;
-begin
-  // More aggressive batching for better performance
-  if UDP_MAX_SAFE_PAYLOAD >= 50000 then
-    Result := 8   // Large chunks = moderate batches
-  else if UDP_MAX_SAFE_PAYLOAD >= 10000 then
-    Result := 15  // Medium chunks = larger batches  
-  else if UDP_MAX_SAFE_PAYLOAD >= 5000 then
-    Result := 25  // Small chunks = larger batches
-  else
-    Result := 50; // Very small chunks = very large batches for speed
 end;
 
 { TncCustomUDPClient }
