@@ -1,194 +1,44 @@
 # NetCom7
 
-The fastest communications possible.
+**The fastest communications possible.**
 
-This is an updated version of the NetCom7 package, now with enhanced **UDP** & **IPV6** support, improved cross-platform capabilities, **high-performance threaded socket components**, **universal socket components with dual protocol support and thread pool processing**, and **TLS/SSL security support**!
+This is an updated version of NetCom7 with **IPv6 support**, **TLS/SSL security**, **new UDP components**, **threaded socket support**, and **dual protocol capabilities**. The library now offers a complete range of networking solutions while maintaining full backward compatibility with existing code.
 
-⚠️ **Note**: TLS/SSL implementation is currently available for **basic raw socket components** (TncTCPClient/TncTCPServer), **raw threaded socket components** (TncServer/TncClient), and **universal socket components** (TncTCPProClient/TncTCPProServer) on Windows platforms through SChannel integration.
+## 🎯 **Latest Updates**
+- **New UDP Support**: Complete UDP component family with three specialized types
+- **Threaded Components**: High-performance TCP components with thread pool processing  
+- **Dual Protocol**: Universal components supporting both raw data and structured commands
+- **TLS/SSL Support**: Secure communications across all component types (Windows)
+- **IPv6 Support**: Full IPv4/IPv6 compatibility (client and server must use same family)
+- **New Demos**: Added comprehensive examples showcasing all new features and components
 
-## 📊 **NetCom7 Socket Components Comparison**
+## 📋 **Component Overview**
 
-| Feature | **ncSockets** | **ncSources** | **ncSocketsPro** ⭐ | **ncTSockets** |
-|---------|---------------|---------------|---------------------|----------------|
-| **Architecture** | Basic Raw Sockets | Command Protocol | **Universal Hybrid** | Raw + Thread Pool |
-| **Socket Access** | ✅ Direct Raw | ❌ Command-Only | ✅ Direct Raw | ✅ Direct Raw |
-| **Custom Protocols** | ✅ Full Freedom | ❌ NetCom7 Only | ✅ Full Freedom | ✅ Full Freedom |
-| **Command Protocol** | ❌ Manual | ✅ Built-in | ✅ Built-in | ❌ Manual |
-| **Protocol Detection** | ❌ Manual | ❌ Single Protocol | ✅ **Automatic** | ❌ Manual |
-| **Thread Pool Processing** | ❌ Manual | ✅ Commands Only | ✅ **Commands + Raw** | ✅ Raw Data Only |
-| **Best For** | Simple protocols | RPC/Commands | **Universal** | High-throughput |
+### **TCP Components**
 
-### **Component Selection Guide**
-- **ncSockets**: Learning, simple protocols, full control
-- **ncSources**: RPC-style command execution, structured protocols  
-- **ncSocketsPro**: **Universal solution - handles any requirement** ⭐
-- **ncTSockets**: High-performance custom protocol processing
+| Component | Classes | Description | Best For |
+|-----------|---------|-------------|----------|
+| **Raw TCP** | `TncTCPServer`<br/>`TncTCPClient` | Basic socket functionality | Simple protocols, learning, full control |
+| **Threaded TCP** 🆕 | `TncTCPServerThd`<br/>`TncTCPClientThd` | Raw sockets + thread pool processing | High-performance custom protocols |
+| **Dual TCP** 🆕 | `TncTCPServerDual`<br/>`TncTCPClientDual` | Raw data + command protocol support | Universal applications, maximum flexibility |
+| **Command Sources** | `TncServerSource`<br/>`TncClientSource` | Command-based communication | RPC systems, legacy applications |
+| **Database** | `TncDBServer`<br/>`TncDBDataset` | Database connectivity | Data synchronization, legacy support |
 
-## Recent Updates
+### **UDP Components**
 
-### 🌟 **Universal Socket Components with Dual Protocol Support + Thread Pool** ⭐
-**TncTCPProClient** and **TncTCPProServer** represent the **ultimate NetCom7 components**, combining the flexibility of ncSockets, the performance of ncSources, and intelligent protocol handling into one powerful solution.
+| Component | Classes | Description | Best For |
+|-----------|---------|-------------|----------|
+| **Raw UDP** 🆕 | `TncUDPServer`<br/>`TncUDPClient` | Basic UDP functionality | Custom protocols, maximum performance |
+| **LCP UDP** 🆕 | `TncUDPServerLCP`<br/>`TncUDPClientLCP` | Command protocol only | RPC systems, structured communication |
+| **Dual UDP** 🆕 | `TncUDPServerDual`<br/>`TncUDPClientDual` | Raw data + command protocol support | Universal UDP applications |
 
-#### Features
-- **Dual Protocol Support**: Handle both raw data and structured commands simultaneously
-- **Thread Pool Command Processing**: Commands execute in high-performance worker threads (like ncSources)
-- **Automatic Protocol Detection**: Uses magic header (`$ACF0FF00`) to intelligently route data
-- **Guaranteed Message Delivery**: `SendCommand()` method ensures complete message transmission
-- **Full Backward Compatibility**: Existing custom protocols work exactly like ncSockets
-
-#### Intelligent Architecture
-```pascal
-Network → Reader Thread → Protocol Detection → {
-  Raw Data → OnReadData (Reader/Main Thread)
-  Commands → Thread Pool → OnCommand (Worker Threads)
-}
-```
-#### Easy Integration
-The **TncTCPProServer** and **TncTCPProClient** components can be dragged from the palette and customized in the object inspector.
-
-![alt text](image-6.png)
-
-![alt text](image-7.png) ![alt text](image-8.png)
-
-![alt text](image-9.png) ![alt text](image-10.png)
+**Legend:** 🆕 New in this version
 
 
-### 🚀 **High-Performance Threaded Socket Components (ncTSockets)**
-**TncServer** and **TncClient** provide raw socket functionality with built-in thread pools for extreme performance:
-
-- **Built-in Thread Pool**: Automatically manages worker threads for concurrent request processing
-- **Raw Socket Performance**: Direct socket access without protocol overhead
-- **TLS/SSL Security Support**: Full TLS encryption support with thread pool processing
-- **Scalable Architecture**: Handles thousands of concurrent connections efficiently  
-- **Simple API**: Easy-to-use interface similar to traditional NetCom7 components
-
-#### Performance Benefits
-- **Up to 3x Performance Improvement**: Compared to traditional single-threaded socket processing
-- **Concurrent Processing**: Multiple client requests handled simultaneously
-- **Efficient Resource Usage**: Thread reuse eliminates expensive thread creation/destruction
-- **High Throughput**: Optimized for high-frequency, low-latency communications
-
-#### Benchmark Results (100 Client Requests)
-
-| Metric | TncServer (Thread Pool) | Basic Socket (No Thread Pool) | Improvement |
-|--------|-------------------------|-------------------------------|-------------|
-| **Requests Completed** | 85 | 30 | **2.8x more** |
-| **Peak Req/Sec** | 39 | 16 | **2.4x faster** |
-| **Average Req/Sec** | 14.2 | 5.0 | **2.8x faster** |
-| **Test Duration** | 6.0s | 6.0s | Same |
-| **Processing Threads** | 16 pool threads | 1 reader thread | **16x resources** |
-| **Success Rate** | 85% | 30% | **2.8x better** |
-
-**Test Scenario**: Client sends 100 rapid requests to both servers simultaneously.
-
-**Key Findings**:
-- **Thread Pool Advantage**: TncServer's 16 worker threads process requests concurrently, while basic socket is limited to sequential processing in a single reader thread
-- **Higher Throughput**: Thread pool completed 85/100 requests vs 30/100 for basic socket
-- **Better Performance**: Consistently higher peak and average request rates
-- **Scalability**: Thread pool architecture scales with available CPU cores (4 threads per CPU)
-
-#### Easy Integration
-The **TncServer** and **TncClient** components can be dragged from the palette and customized in the object inspector with thread pool settings and connection properties.
-
-![alt text](image-3.png)
-
-![alt text](image-4.png) ![alt text](image-5.png)
-
-### Enhanced UDP Support
-The **UDP** components now feature **dual protocol coexistence** similar to ncSocketsPro, allowing both raw data and structured commands on the same connection.
-
-#### 🎯 **Dual Protocol Support**
-**TncUDPClient** and **TncUDPServer** can handle both protocols simultaneously:
-- **Raw Data Packets**: Handled via `OnReadDatagram` event
-- **Command Packets**: Handled via `OnCommand` event  
-- **Automatic Detection**: Uses magic header (`$4E43` - 'NC') for intelligent packet routing
-
-#### 🚀 **Protocol Coexistence Architecture**
-```pascal
-UDP Packet → Protocol Detection → {
-  Raw Data → OnReadDatagram (any data format)
-  Commands → OnCommand (structured with ID, data, flags, sequence)
-}
-```
-
-#### 📡 **Easy API Usage**
-```pascal
-// Send raw data (traditional UDP)
-UDPClient.Send('Hello World');
-UDPServer.SendTo(ResponseData, ClientAddr);
-
-// Send structured commands (new!)
-UDPClient.SendCommand(42, BytesOf('Command Data'));
-UDPServer.SendCommand(ClientAddr, 100, ResponseData);
-
-// Broadcast commands to entire network
-UDPClient.Broadcast := True;
-UDPClient.SendCommand('192.168.1.255', 8080, 200, BroadcastData);
-```
-
-#### 🎭 **Event Handling**
-```pascal
-// Raw data packets (existing)
-procedure OnReadDatagram(Sender: TObject; aLine: TncLine; const aBuf: TBytes; 
-  aBufCount: Integer; const SenderAddr: TSockAddrStorage);
-
-// Command packets (new!)  
-procedure OnCommand(Sender: TObject; aLine: TncLine; const aSenderAddr: TSockAddrStorage;
-  aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
-```
-
-#### ✅ **Key Benefits**
-- **Backward Compatible**: Existing raw UDP code works unchanged
-- **Zero Overhead**: Raw packets have no processing overhead
-- **Network Efficient**: 9-byte command header (magic + cmd + flags + sequence)
-- **Broadcast Support**: Commands work with UDP broadcast functionality
-- **Cross-Platform**: IPv4/IPv6 support with automatic family detection
-
-The **UDP** components can be dragged from the palette and customized in the object inspector with the following properties:
-- Broadcast capabilities
-- Buffer size customization
-- Dual protocol events (OnReadDatagram + OnCommand)
-
-![alt text](image-1.png)
-
-![alt text](image-11.png) ![alt text](image-12.png)
-
-### 🔐 TLS/SSL Security Support
-NetCom7 now includes **TLS/SSL encryption** support for secure communications:
-
-- **Windows SChannel Integration**: Native TLS support using Windows Secure Channel API (Windows only)
-- **Universal Coverage**: TLS support across all socket component types
-- **Easy Configuration**: Simple `UseTLS` property to enable secure communications
-- **Certificate Management**: Built-in support for X.509 certificates and PFX files
-- **Secure Handshake**: Automatic TLS handshake handling with proper certificate validation
-
-#### Supported Components
-- **Basic Raw Sockets**: TncTCPClient and TncTCPServer components
-- **Threaded Raw Sockets**: TncServer and TncClient components  
-- **Universal Sockets**: TncTCPProClient and TncTCPProServer components
-
-#### Key Features
-- **Transport Layer Security**: Industry-standard TLS encryption for data protection
-- **Native Windows API**: Uses Windows SChannel for optimal performance and security
-- **Seamless Integration**: TLS functionality integrated into existing NetCom7 architecture
-- **OnBeforeConnected Events**: TLS handshake occurs before connection establishment
-
-⚠️ **Note**: TLS support is currently available for Windows platforms only through SChannel integration.
-
-### IPV6
-
-TCP v4 / TCP v6 / UDP v4 / UDP v6 are now avaible.
-
-⚠️ Client and Server must use the same familly version (no dual-stack sockets).
-
-![alt text](image-2.png)
-
-### Demo Updates
-- Added new `SimpleThreadedSockets` demo
-- Added new `SimpleSockets_UDP` demo
-- Added new `SimpleSockets_UDP_ImageDisplay` demo
-- Added new `SimpleSockets_TLS` demo for TLS/SSL secure communications (basic raw sockets)
-- Added new `SimpleThreadedSockets_TLS` demo for TLS/SSL secure communications (raw threaded sockets)
-- Updated the `SimpleSockets` demo
-- Added new `ThreadedSocketsBenchmark` demo for performance testing and comparison
-- Added new `Multi-Socket_ncSocketsPro` demo showcasing dual protocol support, thread pool processing, and guaranteed message delivery
+## ⚡ **Key Features**
+- **Auto-chunking**: Large data automatically split and reassembled
+- **TLS/SSL**: Secure communications with certificate support
+- **Thread pools**: High-performance concurrent processing
+- **Protocol detection**: Automatic routing of raw vs command data
+- **IPv4/IPv6**: Full IPv4 and IPv6 support (client/server must use same family, no dual-stack sockets)
+- **Cross-platform**: Windows, macOS, Linux compatibility

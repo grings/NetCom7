@@ -4,7 +4,8 @@ interface
 
 uses
   WinApi.Windows, System.Classes, System.SysUtils, ToolsAPI, DesignIntf, DesignEditors,
-  ncSockets, ncSocketsPro, ncSources, ncTSockets, ncCommandHandlers, ncDBSrv, ncDBCnt, ncUDPSockets;
+  ncSockets, ncSocketsDual, ncSources, ncSocketsThd, ncCommandHandlers, ncDBSrv, ncDBCnt, 
+  ncUDPSockets, ncUDPSocketsLCP, ncUDPSocketsDual;
 
 type
   TncTCPSocketDefaultEditor = class(TDefaultEditor)
@@ -13,6 +14,16 @@ type
   end;
 
   TncUDPSocketDefaultEditor = class(TDefaultEditor)  // Added UDP editor
+  public
+    procedure EditProperty(const Prop: IProperty; var Continue: Boolean); override;
+  end;
+
+  TncUDPSocketLCPDefaultEditor = class(TDefaultEditor)  // Added UDP LCP editor
+  public
+    procedure EditProperty(const Prop: IProperty; var Continue: Boolean); override;
+  end;
+
+  TncUDPSocketDualDefaultEditor = class(TDefaultEditor)  // Added UDP Dual editor
   public
     procedure EditProperty(const Prop: IProperty; var Continue: Boolean); override;
   end;
@@ -31,12 +42,16 @@ begin
   RegisterComponents('NetCom7', [
     TncTCPServer,
     TncTCPClient,
-    TncTCPProServer,  // Pro enhanced socket components
-    TncTCPProClient,
-    TncServer,        // New threaded socket components
-    TncClient,
-    TncUDPServer,     // Added UDP components
+    TncTCPServerDual,  // Dual enhanced socket components
+    TncTCPClientDual,
+    TncTCPServerThd,        // Threaded socket components
+    TncTCPClientThd,
+    TncUDPServer,     // Raw UDP components
     TncUDPClient,
+    TncUDPServerLCP,  // LCP-only UDP components
+    TncUDPClientLCP,
+    TncUDPServerDual, // Dual-mode UDP components
+    TncUDPClientDual,
     TncServerSource,
     TncClientSource,
     TncCommandHandler,
@@ -46,12 +61,16 @@ begin
 
   RegisterComponentEditor(TncTCPServer, TncTCPSocketDefaultEditor);
   RegisterComponentEditor(TncTCPClient, TncTCPSocketDefaultEditor);
-  RegisterComponentEditor(TncTCPProServer, TncTCPSocketDefaultEditor);  // Pro enhanced socket editors
-  RegisterComponentEditor(TncTCPProClient, TncTCPSocketDefaultEditor);
-  RegisterComponentEditor(TncServer, TncTCPSocketDefaultEditor);     // New threaded socket editors
-  RegisterComponentEditor(TncClient, TncTCPSocketDefaultEditor);
-  RegisterComponentEditor(TncUDPServer, TncUDPSocketDefaultEditor);  // Added UDP editors
+  RegisterComponentEditor(TncTCPServerDual, TncTCPSocketDefaultEditor);  // Dual enhanced socket editors
+  RegisterComponentEditor(TncTCPClientDual, TncTCPSocketDefaultEditor);
+  RegisterComponentEditor(TncTCPServerThd, TncTCPSocketDefaultEditor);     // Threaded socket editors
+  RegisterComponentEditor(TncTCPClientThd, TncTCPSocketDefaultEditor);
+  RegisterComponentEditor(TncUDPServer, TncUDPSocketDefaultEditor);  // Raw UDP editors
   RegisterComponentEditor(TncUDPClient, TncUDPSocketDefaultEditor);
+  RegisterComponentEditor(TncUDPServerLCP, TncUDPSocketLCPDefaultEditor);  // LCP UDP editors
+  RegisterComponentEditor(TncUDPClientLCP, TncUDPSocketLCPDefaultEditor);
+  RegisterComponentEditor(TncUDPServerDual, TncUDPSocketDualDefaultEditor);  // Dual UDP editors
+  RegisterComponentEditor(TncUDPClientDual, TncUDPSocketDualDefaultEditor);
   RegisterComponentEditor(TncServerSource, TncSourceDefaultEditor);
   RegisterComponentEditor(TncClientSource, TncSourceDefaultEditor);
 
@@ -162,6 +181,33 @@ end;
 procedure TncUDPSocketDefaultEditor.EditProperty(const Prop: IProperty; var Continue: Boolean);
 begin
   if CompareText(Prop.GetName, 'ONREADDATAGRAM') = 0 then
+  begin
+    Prop.Edit;
+    Continue := False;
+  end
+  else
+    inherited;
+end;
+
+{ TncUDPSocketLCPDefaultEditor }  // Added UDP LCP editor implementation
+
+procedure TncUDPSocketLCPDefaultEditor.EditProperty(const Prop: IProperty; var Continue: Boolean);
+begin
+  if CompareText(Prop.GetName, 'ONCOMMAND') = 0 then
+  begin
+    Prop.Edit;
+    Continue := False;
+  end
+  else
+    inherited;
+end;
+
+{ TncUDPSocketDualDefaultEditor }  // Added UDP Dual editor implementation
+
+procedure TncUDPSocketDualDefaultEditor.EditProperty(const Prop: IProperty; var Continue: Boolean);
+begin
+  if (CompareText(Prop.GetName, 'ONREADDATAGRAM') = 0) or 
+     (CompareText(Prop.GetName, 'ONCOMMAND') = 0) then
   begin
     Prop.Edit;
     Continue := False;
