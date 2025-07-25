@@ -1401,7 +1401,7 @@ begin
     Fragments[FragmentIndex div 32] := Fragments[FragmentIndex div 32] or (UInt32(1) shl (FragmentIndex mod 32));
 end;
 
-{ TncCustomUDPServerLCP }
+{ TncCustomUDPServerDual }
 
 constructor TncCustomUDPServerLCP.Create(AOwner: TComponent);
 begin
@@ -1555,7 +1555,7 @@ begin
     SendTo(bytes[0], len, DestAddr);
 end;
 
-// UDP Command Protocol Methods for TncCustomUDPServerLCP
+// UDP Command Protocol Methods for TncCustomUDPServerDual
 
 procedure TncCustomUDPServerLCP.SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
@@ -1936,7 +1936,3 @@ begin
 end;
 
 end.
-
-
-
-

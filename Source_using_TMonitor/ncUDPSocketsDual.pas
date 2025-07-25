@@ -1,23 +1,26 @@
-unit ncUDPSocketsLCP;
+unit ncUDPSocketsDual;
 // /////////////////////////////////////////////////////////////////////////////
 //
-// NetCom7 Package - UDP Socket Components (LCP Only - Protocol Only)
+// NetCom7 Package - UDP Socket Components (Dual Mode - Raw + Protocol)
 //
-// This unit implements UDP Server and UDP Client components with 
-// lightweight command protocol support ONLY (no raw UDP support)
+// This unit implements UDP Server and UDP Client components with both
+// raw UDP support and lightweight command protocol support
+//
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
 //
 // 23/07/2025
-// - Removed raw UDP support (OnReadData)
-// - Protocol-only implementation
+// - Lightweight Command Protocol (LCP)
+// - Auto-chunking for large data
+// 14/1/2025
+// - Initial creation
 // Currently implemented :
 // - Broadcast
-// - Lightweight Command Protocol (LCP) ONLY
-// - Auto-chunking for large data
+// - Raw UDP communication
 //
 // Written by J.Pauwels
 //
 // /////////////////////////////////////////////////////////////////////////////
-
 
 {$IF CompilerVersion >= 21.0}
 {$WEAKLINKRTTI ON}
@@ -103,7 +106,7 @@ type
   TncChunkManager = class
   private
     FTransfers: TDictionary<UInt32, TChunkTransfer>; // Hash table for O(1) lookup
-    FLock: TCriticalSection;
+    FLock: TObject; // TMonitor synchronization object
     function GenerateTransferID: UInt32;
     procedure CleanupExpiredTransfers;
   public
@@ -121,7 +124,7 @@ resourcestring
   ECannotSetHostWhileSocketActiveStr = 'Cannot set Host property while socket is active';
   ECannotSendWhileSocketInactiveStr = 'Cannot send data while socket is inactive';
   ECannotSetUseReaderThreadWhileSocketActiveStr = 'Cannot set UseReaderThread property while socket is active';
-  ECannotReceiveIfUseReaderThreadStr = 'Cannot receive data if UseReaderThread is set. Use OnCommand event handler to get protocol data or set UseReaderThread property to false';
+  ECannotReceiveIfUseReaderThreadStr = 'Cannot receive data if UseReaderThread is set. Use OnReadDatagram event handler to get the data or set UseReaderThread property to false';
   ECannotSetFamilyWhileConnectionIsActiveStr = 'Cannot set Family property whilst the connection is active';
 type
   EPropertySetError = class(Exception);
@@ -135,7 +138,7 @@ type
 
 
   // Base UDP Socket class
-  TncUDPBaseLCP = class(TComponent)
+  TncUDPBaseDual = class(TComponent)
   private
     FInitActive: Boolean;
     FFamily: TAddressType;
@@ -144,6 +147,7 @@ type
     FBroadcast: Boolean;
     FLine: TncLine;
     FReadBufferLen: Integer;
+    FOnReadDatagram: TncOnDatagramEvent;
     FOnCommand: TncOnUDPCommandEvent;
     FChunkManager: TncChunkManager;  // For auto-chunking large commands
     function GetReadBufferLen: Integer;
@@ -164,7 +168,7 @@ type
     procedure DoActivate(aActivate: Boolean); virtual; abstract;
     procedure SetUseReaderThread(const Value: Boolean);
   protected
-    PropertyLock: TCriticalSection;
+    PropertyLock: TObject; // TMonitor synchronization object
     ReadBuf: TBytes;
     procedure Loaded; override;
     function CreateLineObject: TncLine; virtual;
@@ -183,6 +187,7 @@ type
     property EventsUseMainThread: Boolean read FEventsUseMainThread write FEventsUseMainThread default DefEventsUseMainThread;
     property UseReaderThread: Boolean read FUseReaderThread write SetUseReaderThread default DefUseReaderThread;
     property Broadcast: Boolean read GetBroadcast write SetBroadcast default DefBroadcast;
+    property OnReadDatagram: TncOnDatagramEvent read FOnReadDatagram write FOnReadDatagram;
     property OnCommand: TncOnUDPCommandEvent read FOnCommand write FOnCommand;
     property ReadBufferLen: Integer read GetReadBufferLen write SetReadBufferLen default DefReadBufferLen;
   published
@@ -191,7 +196,7 @@ type
   // UDP Client implementation
   TncUDPClientProcessor = class;
 
-  TncCustomUDPClientLCP = class(TncUDPBaseLCP)
+  TncCustomUDPClientDual = class(TncUDPBaseDual)
   private
     FHost: string;
     function GetActive: Boolean; override;
@@ -220,7 +225,7 @@ type
     property Host: string read GetHost write SetHost;
   end;
 
-  TncUDPClientLCP = class(TncCustomUDPClientLCP)
+  TncUDPClientDual = class(TncCustomUDPClientDual)
   published
     property Active;
     property Family;
@@ -231,15 +236,16 @@ type
     property UseReaderThread;
     property Broadcast;
     property ReadBufferLen;
+    property OnReadDatagram;
     property OnCommand;
   end;
 
   TncUDPClientProcessor = class(TncReadyThread)
   private
-    FClientSocket: TncCustomUDPClientLCP;
+    FClientSocket: TncCustomUDPClientDual;
   public
     ReadySocketsChanged: Boolean;
-    constructor Create(aClientSocket: TncCustomUDPClientLCP);
+    constructor Create(aClientSocket: TncCustomUDPClientDual);
     procedure ProcessDatagram; inline;
     procedure ProcessEvent; override;
   end;
@@ -247,7 +253,7 @@ type
   // UDP Server implementation
   TncUDPServerProcessor = class;
 
-  TncCustomUDPServerLCP = class(TncUDPBaseLCP)
+  TncCustomUDPServerDual = class(TncUDPBaseDual)
   private
     function GetActive: Boolean; override;
   protected
@@ -269,7 +275,7 @@ type
     function Receive(aTimeout: Cardinal = 2000): TBytes;
   end;
 
-  TncUDPServerLCP = class(TncCustomUDPServerLCP)
+  TncUDPServerDual = class(TncCustomUDPServerDual)
   published
     property Active;
     property Family;
@@ -279,15 +285,17 @@ type
     property UseReaderThread;
     property Broadcast;
     property ReadBufferLen;
+    property OnReadDatagram;
     property OnCommand;
   end;
 
   TncUDPServerProcessor = class(TncReadyThread)
   private
-    FServerSocket: TncCustomUDPServerLCP;
+    FServerSocket: TncCustomUDPServerDual;
   public
+    ReadySockets: TSocketHandleArray;
     ReadySocketsChanged: Boolean;
-    constructor Create(aServerSocket: TncCustomUDPServerLCP);
+    constructor Create(aServerSocket: TncCustomUDPServerDual);
     procedure ProcessDatagram; inline;
     procedure ProcessEvent; override;
   end;
@@ -303,13 +311,13 @@ type
 
 implementation
 
-{ TncUDPBaseLCP }
+{ TncUDPBaseDual }
 
-constructor TncUDPBaseLCP.Create(AOwner: TComponent);
+constructor TncUDPBaseDual.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
-  PropertyLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
 
   FInitActive := False;
   FFamily := DefFamily;
@@ -318,6 +326,7 @@ begin
   FUseReaderThread := DefUseReaderThread;
   FBroadcast := DefBroadcast;
   FReadBufferLen := DefReadBufferLen;
+  FOnReadDatagram := nil;
   FOnCommand := nil;
   FChunkManager := TncChunkManager.Create; // Initialize the chunk manager
 
@@ -325,55 +334,55 @@ begin
 
 end;
 
-function TncUDPBaseLCP.Kind: TSocketType;
+function TncUDPBaseDual.Kind: TSocketType;
 begin
   Result := stUDP;
 end;
 
-destructor TncUDPBaseLCP.Destroy;
+destructor TncUDPBaseDual.Destroy;
 begin
   PropertyLock.Free;
   FChunkManager.Free; // Free the chunk manager
   inherited Destroy;
 end;
 
-procedure TncUDPBaseLCP.Loaded;
+procedure TncUDPBaseDual.Loaded;
 begin
   inherited Loaded;
   if FInitActive then
     DoActivate(True);
 end;
 
-function TncUDPBaseLCP.CreateLineObject: TncLine;
+function TncUDPBaseDual.CreateLineObject: TncLine;
 begin
   Result := TncLine.Create;
   TncLineInternal(Result).SetKind(Kind);
   TncLineInternal(Result).SetFamily(FFamily);
 end;
 
-procedure TncUDPBaseLCP.SetActive(const Value: Boolean);
+procedure TncUDPBaseDual.SetActive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     if not(csLoading in ComponentState) then
       DoActivate(Value);
     FInitActive := GetActive;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-function TncUDPBaseLCP.GetFamily: TAddressType;
+function TncUDPBaseDual.GetFamily: TAddressType;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FFamily;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncUDPBaseLCP.SetFamily(const Value: TAddressType);
+procedure TncUDPBaseDual.SetFamily(const Value: TAddressType);
 begin
   if not(csLoading in ComponentState) then
   begin
@@ -382,7 +391,7 @@ begin
         (ECannotSetFamilyWhileConnectionIsActiveStr);
   end;
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Update base class family
     FFamily := Value;
@@ -393,47 +402,47 @@ begin
       TncLineInternal(FLine).SetFamily(Value);
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-function TncUDPBaseLCP.GetPort: Integer;
+function TncUDPBaseDual.GetPort: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPort;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncUDPBaseLCP.SetPort(const Value: Integer);
+procedure TncUDPBaseDual.SetPort(const Value: Integer);
 begin
   if not(csLoading in ComponentState) then
     if Active then
       raise EPropertySetError.Create(ECannotSetPortWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPort := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-function TncUDPBaseLCP.GetReaderThreadPriority: TncThreadPriority;
+function TncUDPBaseDual.GetReaderThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := ToNcThreadPriority(LineProcessor.Priority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncUDPBaseLCP.SetReaderThreadPriority(const Value: TncThreadPriority);
+procedure TncUDPBaseDual.SetReaderThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     try
       LineProcessor.Priority := FromNcThreadPriority(Value);
@@ -441,68 +450,68 @@ begin
       // Some android devices cannot handle changing priority
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-function TncUDPBaseLCP.GetBroadcast: Boolean;
+function TncUDPBaseDual.GetBroadcast: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FBroadcast;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncUDPBaseLCP.SetBroadcast(const Value: Boolean);
+procedure TncUDPBaseDual.SetBroadcast(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FBroadcast := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncUDPBaseLCP.SetUseReaderThread(const Value: Boolean);
+procedure TncUDPBaseDual.SetUseReaderThread(const Value: Boolean);
 begin
   if not(csLoading in ComponentState) then
     if Active then
       raise EPropertySetError.Create(ECannotSetUseReaderThreadWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseReaderThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-function TncUDPBaseLCP.GetReadBufferLen: Integer;
+function TncUDPBaseDual.GetReadBufferLen: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReadBufferLen;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncUDPBaseLCP.SetReadBufferLen(const Value: Integer);
+procedure TncUDPBaseDual.SetReadBufferLen(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReadBufferLen := Value;
     SetLength(ReadBuf, FReadBufferLen);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-{ TncCustomUDPClientLCP }
+{ TncCustomUDPClientDual }
 
-constructor TncCustomUDPClientLCP.Create(AOwner: TComponent);
+constructor TncCustomUDPClientDual.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
@@ -525,7 +534,7 @@ begin
   end;
 end;
 
-destructor TncCustomUDPClientLCP.Destroy;
+destructor TncCustomUDPClientDual.Destroy;
 begin
   Active := False;
 
@@ -539,12 +548,12 @@ begin
   inherited Destroy;
 end;
 
-function TncCustomUDPClientLCP.GetLine: TncLine;
+function TncCustomUDPClientDual.GetLine: TncLine;
 begin
   Result := Line;
 end;
 
-procedure TncCustomUDPClientLCP.DoActivate(aActivate: Boolean);
+procedure TncCustomUDPClientDual.DoActivate(aActivate: Boolean);
 begin
   // Exit if socket is already in requested state
   if aActivate = GetActive then
@@ -604,36 +613,36 @@ begin
   end;
 end;
 
-function TncCustomUDPClientLCP.GetActive: Boolean;
+function TncCustomUDPClientDual.GetActive: Boolean;
 begin
   Result := Line.Active;
 end;
 
-function TncCustomUDPClientLCP.GetHost: string;
+function TncCustomUDPClientDual.GetHost: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FHost;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncCustomUDPClientLCP.SetHost(const Value: string);
+procedure TncCustomUDPClientDual.SetHost(const Value: string);
 begin
   if not(csLoading in ComponentState) then
     if Active then
       raise EPropertySetError.Create(ECannotSetHostWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FHost := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
-procedure TncCustomUDPClientLCP.Send(const aBuf; aBufSize: Integer);
+procedure TncCustomUDPClientDual.Send(const aBuf; aBufSize: Integer);
 var
   storage: TSockAddrStorage;
   addrV4: PSockAddrIn;
@@ -717,25 +726,25 @@ begin
   end;
 end;
 
-procedure TncCustomUDPClientLCP.Send(const aBytes: TBytes);
+procedure TncCustomUDPClientDual.Send(const aBytes: TBytes);
 begin
   if Length(aBytes) > 0 then
     Send(aBytes[0], Length(aBytes));
 end;
 
-procedure TncCustomUDPClientLCP.Send(const aStr: string);
+procedure TncCustomUDPClientDual.Send(const aStr: string);
 begin
   Send(BytesOf(aStr));
 end;
 
-// UDP Command Protocol Methods for TncCustomUDPClientLCP
+// UDP Command Protocol Methods for TncCustomUDPClientDual
 
-procedure TncCustomUDPClientLCP.SendCommand(aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
+procedure TncCustomUDPClientDual.SendCommand(aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 begin
   SendCommand(FHost, FPort, aCmd, aData, aFlags, aSequence);
 end;
 
-procedure TncCustomUDPClientLCP.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
+procedure TncCustomUDPClientDual.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
   HeaderSize, DataSize, TotalSize: Integer;
   storage: TSockAddrStorage;
@@ -883,7 +892,7 @@ begin
 end;
 
 // 1. Base SendTo that does the actual sending
-procedure TncCustomUDPClientLCP.SendTo(const aBuf; aBufSize: Integer;
+procedure TncCustomUDPClientDual.SendTo(const aBuf; aBufSize: Integer;
   const DestAddr: TSockAddrStorage);
 var
   AddrLen: Integer;
@@ -929,7 +938,7 @@ begin
 end;
 
 // 2. SendTo for byte arrays
-procedure TncCustomUDPClientLCP.SendTo(const aBytes: TBytes;
+procedure TncCustomUDPClientDual.SendTo(const aBytes: TBytes;
   const DestAddr: TSockAddrStorage);
 begin
   if Length(aBytes) > 0 then
@@ -937,7 +946,7 @@ begin
 end;
 
 // 3. SendTo for strings
-procedure TncCustomUDPClientLCP.SendTo(const aStr: string; const DestAddr: TSockAddrStorage);
+procedure TncCustomUDPClientDual.SendTo(const aStr: string; const DestAddr: TSockAddrStorage);
 var
   bytes: TBytes;
   len: Integer;
@@ -948,7 +957,7 @@ begin
     SendTo(bytes[0], len, DestAddr);
 end;
 
-function TncCustomUDPClientLCP.Receive(aTimeout: Cardinal = 2000): TBytes;
+function TncCustomUDPClientDual.Receive(aTimeout: Cardinal = 2000): TBytes;
 var
   BufRead: Integer;
   SenderAddr: TSockAddrStorage;
@@ -1004,7 +1013,7 @@ end;
 
 { TncUDPClientProcessor }
 
-constructor TncUDPClientProcessor.Create(aClientSocket: TncCustomUDPClientLCP);
+constructor TncUDPClientProcessor.Create(aClientSocket: TncCustomUDPClientDual);
 begin
   FClientSocket := aClientSocket;
   ReadySocketsChanged := False;
@@ -1127,11 +1136,38 @@ begin
             end;
           end;
         end;
+      end
+      else
+      begin
+        // ===============================================
+        // RAW DATA PACKET
+        // ===============================================
+        if Assigned(FClientSocket.OnReadDatagram) then
+          try
+            FClientSocket.OnReadDatagram(FClientSocket,
+              FClientSocket.Line,
+              FClientSocket.ReadBuf,
+              BufRead,
+              SenderAddr);
+          except
+          end;
       end;
-      // NOTE: LCP ONLY - No else clause for raw data
-      // Any non-protocol packets are silently ignored
+    end
+    else
+    begin
+      // ===============================================
+      // TOO SMALL - Raw data
+      // ===============================================
+      if Assigned(FClientSocket.OnReadDatagram) then
+        try
+          FClientSocket.OnReadDatagram(FClientSocket,
+            FClientSocket.Line,
+            FClientSocket.ReadBuf,
+            BufRead,
+            SenderAddr);
+        except
+        end;
     end;
-    // NOTE: LCP ONLY - Packets too small for protocol headers are silently ignored
   end;
 end;
 
@@ -1166,7 +1202,7 @@ end;
 constructor TncChunkManager.Create;
 begin
   inherited Create;
-  FLock := TCriticalSection.Create;
+  FLock := TObject.Create;
   FTransfers := TDictionary<UInt32, TChunkTransfer>.Create;
 end;
 
@@ -1215,7 +1251,7 @@ var
   MaxDataSize: Integer;
   BitArraySize: Integer;
 begin
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     CleanupExpiredTransfers;
 
@@ -1244,7 +1280,7 @@ begin
 
     Result := Transfer.TransferID;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1255,7 +1291,7 @@ var
   BitArraySize: Integer;
 begin
   Result := False;
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     // Check if transfer already exists
     if FTransfers.TryGetValue(ATransferID, Transfer) then
@@ -1290,7 +1326,7 @@ begin
 
     Result := True;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1308,7 +1344,7 @@ begin
   if DataSize = 0 then Exit;
 
   // Single lock operation only
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     if FTransfers.TryGetValue(ATransferID, Transfer) then
     begin
@@ -1344,7 +1380,7 @@ begin
       end;
     end;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1354,7 +1390,7 @@ var
   Transfer: TChunkTransfer;
 begin
   Result := False;
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     if FTransfers.TryGetValue(ATransferID, Transfer) and (Transfer.FragmentsRemaining = 0) then
     begin
@@ -1377,7 +1413,7 @@ begin
       Result := True;
     end;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1401,9 +1437,9 @@ begin
     Fragments[FragmentIndex div 32] := Fragments[FragmentIndex div 32] or (UInt32(1) shl (FragmentIndex mod 32));
 end;
 
-{ TncCustomUDPServerLCP }
+{ TncCustomUDPServerDual }
 
-constructor TncCustomUDPServerLCP.Create(AOwner: TComponent);
+constructor TncCustomUDPServerDual.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
@@ -1424,7 +1460,7 @@ begin
   end;
 end;
 
-destructor TncCustomUDPServerLCP.Destroy;
+destructor TncCustomUDPServerDual.Destroy;
 begin
   Active := False;
 
@@ -1438,17 +1474,17 @@ begin
   inherited Destroy;
 end;
 
-function TncCustomUDPServerLCP.GetLine: TncLine;
+function TncCustomUDPServerDual.GetLine: TncLine;
 begin
   Result := Line;
 end;
 
-function TncCustomUDPServerLCP.GetActive: Boolean;
+function TncCustomUDPServerDual.GetActive: Boolean;
 begin
   Result := Line.Active;
 end;
 
-procedure TncCustomUDPServerLCP.DoActivate(aActivate: Boolean);
+procedure TncCustomUDPServerDual.DoActivate(aActivate: Boolean);
 begin
   if aActivate = GetActive then
     Exit;
@@ -1495,7 +1531,7 @@ begin
 end;
 
 // 1. Base SendTo that does the actual sending
-procedure TncCustomUDPServerLCP.SendTo(const aBuf; aBufSize: Integer; const DestAddr: TSockAddrStorage);
+procedure TncCustomUDPServerDual.SendTo(const aBuf; aBufSize: Integer; const DestAddr: TSockAddrStorage);
 var
   AddrLen: Integer;
   {$IFDEF MSWINDOWS}
@@ -1537,14 +1573,14 @@ begin
 end;
 
 // 2. SendTo for byte arrays
-procedure TncCustomUDPServerLCP.SendTo(const aBytes: TBytes; const DestAddr: TSockAddrStorage);
+procedure TncCustomUDPServerDual.SendTo(const aBytes: TBytes; const DestAddr: TSockAddrStorage);
 begin
   if Length(aBytes) > 0 then
     SendTo(aBytes[0], Length(aBytes), DestAddr);
 end;
 
 // 3. SendTo for strings
-procedure TncCustomUDPServerLCP.SendTo(const aStr: string; const DestAddr: TSockAddrStorage);
+procedure TncCustomUDPServerDual.SendTo(const aStr: string; const DestAddr: TSockAddrStorage);
 var
   bytes: TBytes;
   len: Integer;
@@ -1555,9 +1591,9 @@ begin
     SendTo(bytes[0], len, DestAddr);
 end;
 
-// UDP Command Protocol Methods for TncCustomUDPServerLCP
+// UDP Command Protocol Methods for TncCustomUDPServerDual
 
-procedure TncCustomUDPServerLCP.SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
+procedure TncCustomUDPServerDual.SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
   HeaderSize, DataSize, TotalSize: Integer;
 
@@ -1646,7 +1682,7 @@ begin
   end;
 end;
 
-procedure TncCustomUDPServerLCP.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
+procedure TncCustomUDPServerDual.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
   storage: TSockAddrStorage;
   addrV4: PSockAddrIn;
@@ -1717,7 +1753,7 @@ begin
   end;
 end;
 
-function TncCustomUDPServerLCP.Receive(aTimeout: Cardinal = 2000): TBytes;
+function TncCustomUDPServerDual.Receive(aTimeout: Cardinal = 2000): TBytes;
 var
   BufRead: Integer;
   SenderAddr: TSockAddrStorage;
@@ -1773,7 +1809,7 @@ end;
 
 { TncUDPServerProcessor }
 
-constructor TncUDPServerProcessor.Create(aServerSocket: TncCustomUDPServerLCP);
+constructor TncUDPServerProcessor.Create(aServerSocket: TncCustomUDPServerDual);
 begin
   FServerSocket := aServerSocket;
   ReadySocketsChanged := False;
@@ -1895,11 +1931,32 @@ begin
             end;
           end;
         end;
+      end
+      else
+      begin
+        // ===============================================
+        // RAW DATA PACKET
+        // ===============================================
+        if Assigned(FServerSocket.OnReadDatagram) then
+          try
+            FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
+              FServerSocket.ReadBuf, BufRead, SenderAddr);
+          except
+          end;
       end;
-      // NOTE: LCP ONLY - No else clause for raw data
-      // Any non-protocol packets are silently ignored
+    end
+    else
+    begin
+      // ===============================================
+      // TOO SMALL - Raw data
+      // ===============================================
+      if Assigned(FServerSocket.OnReadDatagram) then
+        try
+          FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
+            FServerSocket.ReadBuf, BufRead, SenderAddr);
+        except
+        end;
     end;
-    // NOTE: LCP ONLY - Packets too small for protocol headers are silently ignored
   end;
 end;
 

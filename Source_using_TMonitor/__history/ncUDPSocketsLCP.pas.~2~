@@ -6,6 +6,9 @@ unit ncUDPSocketsLCP;
 // This unit implements UDP Server and UDP Client components with 
 // lightweight command protocol support ONLY (no raw UDP support)
 //
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // 23/07/2025
 // - Removed raw UDP support (OnReadData)
 // - Protocol-only implementation
@@ -103,7 +106,7 @@ type
   TncChunkManager = class
   private
     FTransfers: TDictionary<UInt32, TChunkTransfer>; // Hash table for O(1) lookup
-    FLock: TCriticalSection;
+    FLock: TObject; // TMonitor synchronization object
     function GenerateTransferID: UInt32;
     procedure CleanupExpiredTransfers;
   public
@@ -164,7 +167,7 @@ type
     procedure DoActivate(aActivate: Boolean); virtual; abstract;
     procedure SetUseReaderThread(const Value: Boolean);
   protected
-    PropertyLock: TCriticalSection;
+    PropertyLock: TObject; // TMonitor synchronization object
     ReadBuf: TBytes;
     procedure Loaded; override;
     function CreateLineObject: TncLine; virtual;
@@ -309,7 +312,7 @@ constructor TncUDPBaseLCP.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
-  PropertyLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
 
   FInitActive := False;
   FFamily := DefFamily;
@@ -353,23 +356,23 @@ end;
 
 procedure TncUDPBaseLCP.SetActive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     if not(csLoading in ComponentState) then
       DoActivate(Value);
     FInitActive := GetActive;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseLCP.GetFamily: TAddressType;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FFamily;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -382,7 +385,7 @@ begin
         (ECannotSetFamilyWhileConnectionIsActiveStr);
   end;
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Update base class family
     FFamily := Value;
@@ -393,17 +396,17 @@ begin
       TncLineInternal(FLine).SetFamily(Value);
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseLCP.GetPort: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPort;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -413,27 +416,27 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetPortWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPort := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseLCP.GetReaderThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := ToNcThreadPriority(LineProcessor.Priority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBaseLCP.SetReaderThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     try
       LineProcessor.Priority := FromNcThreadPriority(Value);
@@ -441,7 +444,7 @@ begin
       // Some android devices cannot handle changing priority
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1166,7 +1169,7 @@ end;
 constructor TncChunkManager.Create;
 begin
   inherited Create;
-  FLock := TCriticalSection.Create;
+  FLock := TObject.Create;
   FTransfers := TDictionary<UInt32, TChunkTransfer>.Create;
 end;
 
@@ -1401,7 +1404,7 @@ begin
     Fragments[FragmentIndex div 32] := Fragments[FragmentIndex div 32] or (UInt32(1) shl (FragmentIndex mod 32));
 end;
 
-{ TncCustomUDPServerLCP }
+{ TncCustomUDPServerDual }
 
 constructor TncCustomUDPServerLCP.Create(AOwner: TComponent);
 begin
@@ -1555,7 +1558,7 @@ begin
     SendTo(bytes[0], len, DestAddr);
 end;
 
-// UDP Command Protocol Methods for TncCustomUDPServerLCP
+// UDP Command Protocol Methods for TncCustomUDPServerDual
 
 procedure TncCustomUDPServerLCP.SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
 var
@@ -1936,7 +1939,3 @@ begin
 end;
 
 end.
-
-
-
-
