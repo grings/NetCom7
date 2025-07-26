@@ -5,9 +5,6 @@ unit ncUDPSockets;
 //
 // This unit implements UDP Server and UDP Client components
 //
-// 25/07/2025- by J.Pauwels
-// - Replace TCriticalSection to TMonitor
-//
 // 14/1/2025
 // - Initial creation
 // Currently implemented :
@@ -43,24 +40,6 @@ const
   DefBroadcast = False;
   DefFamily = afIPv4;
 
-  // UDP Command Protocol Constants
-  UDP_COMMAND_MAGIC = $4E43; // 'NC' signature for protocol detection
-
-type
-  // UDP Command Header Structure
-  TUdpCommandHeader = packed record
-    Cmd: Integer;        // Command ID (matches ncSocketsPro)
-    Flags: Byte;         // Command flags for future extensibility
-    Sequence: UInt16;    // Sequence number for tracking/ordering
-  end;
-
-  // Complete UDP Command Packet Structure
-  TUdpCommandPacket = packed record
-    Magic: UInt16;              // Protocol detection signature
-    Header: TUdpCommandHeader;  // Command header
-    // Variable data follows after this structure
-  end;
-
 resourcestring
   ECannotSetPortWhileSocketActiveStr = 'Cannot set Port property while socket is active';
   ECannotSetHostWhileSocketActiveStr = 'Cannot set Host property while socket is active';
@@ -74,10 +53,6 @@ type
   // Event types for UDP
   TncOnDatagramEvent = procedure(Sender: TObject; aLine: TncLine;const aBuf: TBytes; aBufCount: Integer;const SenderAddr: TSockAddrStorage) of object;
 
-  // UDP Command Protocol Event  
-  TncOnUDPCommandEvent = procedure(Sender: TObject; aLine: TncLine; const aSenderAddr: TSockAddrStorage; 
-    aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16) of object;
-
 
   // Base UDP Socket class
   TncUDPBase = class(TComponent)
@@ -90,7 +65,6 @@ type
     FLine: TncLine;
     FReadBufferLen: Integer;
     FOnReadDatagram: TncOnDatagramEvent;
-    FOnCommand: TncOnUDPCommandEvent;
     function GetReadBufferLen: Integer;
     procedure SetReadBufferLen(const Value: Integer);
     function GetActive: Boolean; virtual; abstract;
@@ -129,7 +103,6 @@ type
     property UseReaderThread: Boolean read FUseReaderThread write SetUseReaderThread default DefUseReaderThread;
     property Broadcast: Boolean read GetBroadcast write SetBroadcast default DefBroadcast;
     property OnReadDatagram: TncOnDatagramEvent read FOnReadDatagram write FOnReadDatagram;
-    property OnCommand: TncOnUDPCommandEvent read FOnCommand write FOnCommand;
     property ReadBufferLen: Integer read GetReadBufferLen write SetReadBufferLen default DefReadBufferLen;
   published
   end;
@@ -157,11 +130,6 @@ type
     procedure Send(const aBuf; aBufSize: Integer); overload;
     procedure Send(const aBytes: TBytes); overload;
     procedure Send(const aStr: string); overload;
-    
-    // UDP Command Protocol Methods
-    procedure SendCommand(aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
-    procedure SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
-    
     function Receive(aTimeout: Cardinal = 2000): TBytes;
     property Host: string read GetHost write SetHost;
   end;
@@ -178,7 +146,6 @@ type
     property Broadcast;
     property ReadBufferLen;
     property OnReadDatagram;
-    property OnCommand;
   end;
 
   TncUDPClientProcessor = class(TncReadyThread)
@@ -208,11 +175,6 @@ type
     procedure SendTo(const aBuf; aBufSize: Integer; const DestAddr: TSockAddrStorage); overload;
     procedure SendTo(const aBytes: TBytes;const DestAddr: TSockAddrStorage); overload;
     procedure SendTo(const aStr: string; const DestAddr: TSockAddrStorage); overload;
-    
-    // UDP Command Protocol Methods
-    procedure SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
-    procedure SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte = 0; aSequence: UInt16 = 0); overload;
-    
     function Receive(aTimeout: Cardinal = 2000): TBytes;
   end;
 
@@ -227,7 +189,6 @@ type
     property Broadcast;
     property ReadBufferLen;
     property OnReadDatagram;
-    property OnCommand;
   end;
 
   TncUDPServerProcessor = class(TncReadyThread)
@@ -268,7 +229,6 @@ begin
   FBroadcast := DefBroadcast;
   FReadBufferLen := DefReadBufferLen;
   FOnReadDatagram := nil;
-  FOnCommand := nil;
 
   SetLength(ReadBuf, DefReadBufferLen);
 
@@ -676,107 +636,6 @@ begin
   Send(BytesOf(aStr));
 end;
 
-// UDP Command Protocol Methods for TncCustomUDPClient
-
-procedure TncCustomUDPClient.SendCommand(aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
-begin
-  SendCommand(FHost, FPort, aCmd, aData, aFlags, aSequence);
-end;
-
-procedure TncCustomUDPClient.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
-var
-  Packet: TBytes;
-  PacketHeader: TUdpCommandPacket;
-  HeaderSize: Integer;
-  DataSize: Integer;
-  storage: TSockAddrStorage;
-  addrV4: PSockAddrIn;
-  addrV6: PSockAddrIn6;
-begin
-  if not Active then
-    raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
-
-  // Build command packet header
-  PacketHeader.Magic := UDP_COMMAND_MAGIC;
-  PacketHeader.Header.Cmd := aCmd;
-  PacketHeader.Header.Flags := aFlags;
-  PacketHeader.Header.Sequence := aSequence;
-
-  // Calculate sizes
-  HeaderSize := SizeOf(TUdpCommandPacket);
-  DataSize := Length(aData);
-
-  // Allocate packet buffer
-  SetLength(Packet, HeaderSize + DataSize);
-
-  // Copy header to packet
-  Move(PacketHeader, Packet[0], HeaderSize);
-
-  // Copy data to packet (if any)
-  if DataSize > 0 then
-    Move(aData[0], Packet[HeaderSize], DataSize);
-
-  // Build destination address and send
-  case Family of
-    afIPv4:
-      begin
-        FillChar(storage, SizeOf(storage), 0);
-        storage.ss_family := AF_INET;
-
-        addrV4 := PSockAddrIn(@storage);
-        addrV4^.sin_family := AF_INET;
-        addrV4^.sin_port := htons(aRemotePort);
-
-        var addr := inet_addr(PAnsiChar(AnsiString(aRemoteHost)));
-        if addr <> INADDR_NONE then
-          addrV4^.sin_addr.S_addr := addr
-        else
-          raise Exception.Create('Invalid IPv4 address format');
-
-        SendTo(Packet, storage);
-      end;
-
-    afIPv6:
-      begin
-        if not TncIPUtils.IsIPv6ValidAddress(aRemoteHost) then
-          raise Exception.Create('Invalid IPv6 address format');
-
-        FillChar(storage, SizeOf(storage), 0);
-        storage.ss_family := AF_INET6;
-
-        addrV6 := PSockAddrIn6(@storage);
-        addrV6^.sin6_family := AF_INET6;
-        addrV6^.sin6_port := htons(aRemotePort);
-
-        // Handle link-local address with scope ID
-        if TncIPUtils.IsLinkLocal(aRemoteHost) then
-        begin
-          var scopePos := Pos('%', aRemoteHost);
-          if scopePos > 0 then
-          begin
-            var hostAddr := Copy(aRemoteHost, 1, scopePos - 1);
-            var scope := Copy(aRemoteHost, scopePos + 1, Length(aRemoteHost));
-            var scopeID: Cardinal;
-            if TryStrToUInt(scope, scopeID) then
-            begin
-              addrV6^.sin6_scope_id := scopeID;
-              if not TncIPUtils.StringToAddress(hostAddr, addrV6^.sin6_addr) then
-                raise Exception.Create('Invalid IPv6 address format');
-            end
-            else
-              raise Exception.Create('Invalid IPv6 scope ID');
-          end
-          else if not TncIPUtils.StringToAddress(aRemoteHost, addrV6^.sin6_addr) then
-            raise Exception.Create('Invalid IPv6 address format');
-        end
-        else if not TncIPUtils.StringToAddress(aRemoteHost, addrV6^.sin6_addr) then
-          raise Exception.Create('Invalid IPv6 address format');
-
-        SendTo(Packet, storage);
-      end;
-  end;
-end;
-
 // 1. Base SendTo that does the actual sending
 procedure TncCustomUDPClient.SendTo(const aBuf; aBufSize: Integer;
   const DestAddr: TSockAddrStorage);
@@ -911,10 +770,6 @@ var
   BufRead: Integer;
   SenderAddr: TSockAddrStorage;
   SenderAddrLen: Integer;
-  Magic: UInt16;
-  CommandHeader: TUdpCommandHeader;
-  CommandData: TBytes;
-  PacketSize: Integer;
 begin
   // Initialize sender address structure
   SenderAddrLen := SizeOf(TSockAddrStorage);
@@ -928,70 +783,15 @@ begin
     PSockAddr(@SenderAddr)^,
     SenderAddrLen);
 
-  if BufRead > 0 then
-  begin
-    // Check if this might be a command packet
-    if (BufRead >= SizeOf(TUdpCommandPacket)) then
-    begin
-      // Extract magic number to check protocol
-      Move(FClientSocket.ReadBuf[0], Magic, SizeOf(Magic));
-      
-      if Magic = UDP_COMMAND_MAGIC then
-      begin
-        // It's a command packet - extract command header
-        Move(FClientSocket.ReadBuf[SizeOf(UInt16)], CommandHeader, SizeOf(CommandHeader));
-        
-        // Extract command data (if any)
-        PacketSize := SizeOf(TUdpCommandPacket);
-        if BufRead > PacketSize then
-        begin
-          SetLength(CommandData, BufRead - PacketSize);
-          Move(FClientSocket.ReadBuf[PacketSize], CommandData[0], BufRead - PacketSize);
-        end
-        else
-          SetLength(CommandData, 0);
-        
-        // Fire OnCommand event
-        if Assigned(FClientSocket.OnCommand) then
-          try
-            FClientSocket.OnCommand(FClientSocket,
-              FClientSocket.Line,
-              SenderAddr,
-              CommandHeader.Cmd,
-              CommandData,
-              CommandHeader.Flags,
-              CommandHeader.Sequence);
-          except
-          end;
-      end
-      else
-      begin
-        // Not a command packet - treat as raw data
-        if Assigned(FClientSocket.OnReadDatagram) then
-          try
-            FClientSocket.OnReadDatagram(FClientSocket,
-              FClientSocket.Line,
-              FClientSocket.ReadBuf,
-              BufRead,
-              SenderAddr);
-          except
-          end;
-      end;
-    end
-    else
-    begin
-      // Too small to be a command packet - treat as raw data
-      if Assigned(FClientSocket.OnReadDatagram) then
-        try
-          FClientSocket.OnReadDatagram(FClientSocket,
-            FClientSocket.Line,
-            FClientSocket.ReadBuf,
-            BufRead,
-            SenderAddr);
-        except
-        end;
+  if (BufRead > 0) and Assigned(FClientSocket.OnReadDatagram) then
+    try
+      FClientSocket.OnReadDatagram(FClientSocket,
+        FClientSocket.Line,
+        FClientSocket.ReadBuf,
+        BufRead,
+        SenderAddr);
+    except
     end;
-  end;
 end;
 
 procedure TncUDPClientProcessor.ProcessEvent;
@@ -1174,109 +974,6 @@ begin
     SendTo(bytes[0], len, DestAddr);
 end;
 
-// UDP Command Protocol Methods for TncCustomUDPServer
-
-procedure TncCustomUDPServer.SendCommand(const DestAddr: TSockAddrStorage; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
-var
-  Packet: TBytes;
-  PacketHeader: TUdpCommandPacket;
-  HeaderSize: Integer;
-  DataSize: Integer;
-begin
-  if not Active then
-    raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
-
-  // Build command packet header
-  PacketHeader.Magic := UDP_COMMAND_MAGIC;
-  PacketHeader.Header.Cmd := aCmd;
-  PacketHeader.Header.Flags := aFlags;
-  PacketHeader.Header.Sequence := aSequence;
-
-  // Calculate sizes
-  HeaderSize := SizeOf(TUdpCommandPacket);
-  DataSize := Length(aData);
-
-  // Allocate packet buffer
-  SetLength(Packet, HeaderSize + DataSize);
-
-  // Copy header to packet
-  Move(PacketHeader, Packet[0], HeaderSize);
-
-  // Copy data to packet (if any)
-  if DataSize > 0 then
-    Move(aData[0], Packet[HeaderSize], DataSize);
-
-  // Send the command packet
-  SendTo(Packet, DestAddr);
-end;
-
-procedure TncCustomUDPServer.SendCommand(const aRemoteHost: string; aRemotePort: Integer; aCmd: Integer; const aData: TBytes; aFlags: Byte; aSequence: UInt16);
-var
-  storage: TSockAddrStorage;
-  addrV4: PSockAddrIn;
-  addrV6: PSockAddrIn6;
-begin
-  // Build destination address based on family
-  case Family of
-    afIPv4:
-      begin
-        FillChar(storage, SizeOf(storage), 0);
-        storage.ss_family := AF_INET;
-
-        addrV4 := PSockAddrIn(@storage);
-        addrV4^.sin_family := AF_INET;
-        addrV4^.sin_port := htons(aRemotePort);
-
-        var addr := inet_addr(PAnsiChar(AnsiString(aRemoteHost)));
-        if addr <> INADDR_NONE then
-          addrV4^.sin_addr.S_addr := addr
-        else
-          raise Exception.Create('Invalid IPv4 address format');
-
-        SendCommand(storage, aCmd, aData, aFlags, aSequence);
-      end;
-
-    afIPv6:
-      begin
-        if not TncIPUtils.IsIPv6ValidAddress(aRemoteHost) then
-          raise Exception.Create('Invalid IPv6 address format');
-
-        FillChar(storage, SizeOf(storage), 0);
-        storage.ss_family := AF_INET6;
-
-        addrV6 := PSockAddrIn6(@storage);
-        addrV6^.sin6_family := AF_INET6;
-        addrV6^.sin6_port := htons(aRemotePort);
-
-        // Handle link-local address with scope ID
-        if TncIPUtils.IsLinkLocal(aRemoteHost) then
-        begin
-          var scopePos := Pos('%', aRemoteHost);
-          if scopePos > 0 then
-          begin
-            var hostAddr := Copy(aRemoteHost, 1, scopePos - 1);
-            var scope := Copy(aRemoteHost, scopePos + 1, Length(aRemoteHost));
-            var scopeID: Cardinal;
-            if TryStrToUInt(scope, scopeID) then
-            begin
-              addrV6^.sin6_scope_id := scopeID;
-              if not TncIPUtils.StringToAddress(hostAddr, addrV6^.sin6_addr) then
-                raise Exception.Create('Invalid IPv6 address format');
-            end
-            else
-              raise Exception.Create('Invalid IPv6 scope ID');
-          end
-          else if not TncIPUtils.StringToAddress(aRemoteHost, addrV6^.sin6_addr) then
-            raise Exception.Create('Invalid IPv6 address format');
-        end
-        else if not TncIPUtils.StringToAddress(aRemoteHost, addrV6^.sin6_addr) then
-          raise Exception.Create('Invalid IPv6 address format');
-
-        SendCommand(storage, aCmd, aData, aFlags, aSequence);
-      end;
-  end;
-end;
-
 function TncCustomUDPServer.Receive(aTimeout: Cardinal = 2000): TBytes;
 var
   BufRead: Integer;
@@ -1346,10 +1043,6 @@ var
   BufRead: Integer;
   SenderAddr: TSockAddrStorage;
   SenderAddrLen: Integer;
-  Magic: UInt16;
-  CommandHeader: TUdpCommandHeader;
-  CommandData: TBytes;
-  PacketSize: Integer;
 begin
   SenderAddrLen := SizeOf(TSockAddrStorage);
   FillChar(SenderAddr, SenderAddrLen, 0);
@@ -1361,64 +1054,12 @@ begin
     PSockAddr(@SenderAddr)^,
     SenderAddrLen);
 
-  if BufRead > 0 then
-  begin
-    // Check if this might be a command packet
-    if (BufRead >= SizeOf(TUdpCommandPacket)) then
-    begin
-      // Extract magic number to check protocol
-      Move(FServerSocket.ReadBuf[0], Magic, SizeOf(Magic));
-      
-      if Magic = UDP_COMMAND_MAGIC then
-      begin
-        // It's a command packet - extract command header
-        Move(FServerSocket.ReadBuf[SizeOf(UInt16)], CommandHeader, SizeOf(CommandHeader));
-        
-        // Extract command data (if any)
-        PacketSize := SizeOf(TUdpCommandPacket);
-        if BufRead > PacketSize then
-        begin
-          SetLength(CommandData, BufRead - PacketSize);
-          Move(FServerSocket.ReadBuf[PacketSize], CommandData[0], BufRead - PacketSize);
-        end
-        else
-          SetLength(CommandData, 0);
-        
-        // Fire OnCommand event
-        if Assigned(FServerSocket.OnCommand) then
-          try
-            FServerSocket.OnCommand(FServerSocket,
-              FServerSocket.Line,
-              SenderAddr,
-              CommandHeader.Cmd,
-              CommandData,
-              CommandHeader.Flags,
-              CommandHeader.Sequence);
-          except
-          end;
-      end
-      else
-      begin
-        // Not a command packet - treat as raw data
-        if Assigned(FServerSocket.OnReadDatagram) then
-          try
-            FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
-              FServerSocket.ReadBuf, BufRead, SenderAddr);
-          except
-          end;
-      end;
-    end
-    else
-    begin
-      // Too small to be a command packet - treat as raw data
-      if Assigned(FServerSocket.OnReadDatagram) then
-        try
-          FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
-            FServerSocket.ReadBuf, BufRead, SenderAddr);
-        except
-        end;
+  if (BufRead > 0) and Assigned(FServerSocket.OnReadDatagram) then
+    try
+      FServerSocket.OnReadDatagram(FServerSocket, FServerSocket.Line,
+        FServerSocket.ReadBuf, BufRead, SenderAddr);
+    except
     end;
-  end;
 end;
 
 procedure TncUDPServerProcessor.ProcessEvent;
