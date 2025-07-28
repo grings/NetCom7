@@ -10,7 +10,7 @@ uses
 {$ENDIF}
   System.Classes, System.SysUtils, Vcl.Forms, Vcl.Controls, Vcl.StdCtrls,
   Vcl.ExtCtrls, Vcl.Samples.Spin, Vcl.ComCtrls,
-  System.Diagnostics, ncLines, ncSocketList, ncSockets, ncTSockets, ncSocketsThd;
+  System.Diagnostics, ncLines, ncSocketList, ncSockets, ncSocketsThd;
 
 type
   TForm1 = class(TForm)

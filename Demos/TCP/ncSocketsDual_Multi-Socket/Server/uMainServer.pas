@@ -4,7 +4,7 @@ interface
 
 uses
   Winapi.Windows, Winapi.Messages, System.SysUtils, System.Classes, Vcl.Forms,
-  Vcl.ComCtrls, ncSocketsPro, Vcl.Controls, Vcl.Menus, Vcl.Graphics,
+  Vcl.ComCtrls, Vcl.Controls, Vcl.Menus, Vcl.Graphics,
   Vcl.Imaging.jpeg, System.Generics.Collections, System.SyncObjs, Vcl.ExtCtrls,
   ncSocketList,Vcl.StdCtrls, ncSocketsDual;
 
