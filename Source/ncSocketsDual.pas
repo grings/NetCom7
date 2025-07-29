@@ -22,6 +22,12 @@ unit ncSocketsDual;
 // - Custom protocols work exactly like ncSockets via OnReadData
 // - Enhanced features available via SendCommand/OnCommand for guaranteed delivery
 //
+// 29/07/2025 - by J.Pauwels
+// - CRITICAL FIX: Fixed TLS disconnection crash by changing from event-driven to direct TLS cleanup
+// - Removed OnBeforeDisconnected := FinalizeTLS assignments from constructors and SetUseTLS
+// - Added direct FinalizeTLS(aLine) calls in DataSocketDisconnected methods for better timing
+// - This aligns ncSocketsDual TLS cleanup pattern with the proven ncSockets approach
+//
 // 15/07/2025 - by J.Pauwels
 // - CRITICAL FIX: Implemented per-connection TLS context storage to support multiple concurrent TLS connections
 // - Fixed TLS multiple client connection issue using TncTlsConnectionContext class
@@ -1004,7 +1010,6 @@ begin
         if Server.Listener <> nil then
         begin
           TncLineInternal(Server.Listener).OnBeforeConnected := HandleTLSHandshake;
-          TncLineInternal(Server.Listener).OnBeforeDisconnected := FinalizeTLS;
         end;
       end
       else if not FIsServer and (Self is TncCustomTCPClientDual) then
@@ -1014,7 +1019,6 @@ begin
         if Client.Line <> nil then
         begin
           TncLineInternal(Client.Line).OnBeforeConnected := HandleTLSHandshake;
-          TncLineInternal(Client.Line).OnBeforeDisconnected := FinalizeTLS;
         end;
       end;
     end;
@@ -1436,7 +1440,6 @@ begin
   if FUseTLS then
   begin
     TncLineInternal(Line).OnBeforeConnected := HandleTLSHandshake;
-    TncLineInternal(Line).OnBeforeDisconnected := FinalizeTLS;
   end;
 
   LineProcessor := TncClientProcessor.Create(Self);
@@ -1534,7 +1537,8 @@ end;
 
 procedure TncCustomTCPClientDual.DataSocketDisconnected(aLine: TncLine);
 begin
-  // TLS cleanup is now handled automatically by OnBeforeDisconnected event
+  if UseTLS then
+    FinalizeTLS(aLine);
 
   if Assigned(OnDisconnected) then
     try
@@ -1542,7 +1546,6 @@ begin
     except
     end;
 end;
-
 
 procedure TncCustomTCPClientDual.Send(const aBuf; aBufSize: Integer);
 begin
@@ -1980,7 +1983,6 @@ begin
   if FUseTLS then
   begin
     TncLineInternal(Listener).OnBeforeConnected := HandleTLSHandshake;
-    TncLineInternal(Listener).OnBeforeDisconnected := FinalizeTLS;
   end;
   Lines := TThreadLineList.Create();
 
@@ -2149,7 +2151,8 @@ begin
     SetLength(ReadSocketHandles, 0)
   else
   begin
-    // TLS cleanup is now handled automatically by OnBeforeDisconnected event
+    if UseTLS then
+      FinalizeTLS(aLine);
 
     // Clean up connection state
     FConnectionStates.Remove(aLine);
