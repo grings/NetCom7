@@ -22,6 +22,9 @@ unit ncSocketsDual;
 // - Custom protocols work exactly like ncSockets via OnReadData
 // - Enhanced features available via SendCommand/OnCommand for guaranteed delivery
 //
+// 11/08/2025 - by J.Pauwels
+// - Added original compression and encryption from ncSources
+//
 // 29/07/2025 - by J.Pauwels
 // - CRITICAL FIX: Fixed TLS disconnection crash by changing from event-driven to direct TLS cleanup
 // - Removed OnBeforeDisconnected := FinalizeTLS assignments from constructors and SetUseTLS

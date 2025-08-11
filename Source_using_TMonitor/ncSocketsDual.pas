@@ -22,6 +22,9 @@ unit ncSocketsDual;
 // - Custom protocols work exactly like ncSockets via OnReadData
 // - Enhanced features available via SendCommand/OnCommand for guaranteed delivery
 //
+// 11/08/2025 - by J.Pauwels
+// - Added original compression and encryption from ncSources
+//
 // 29/07/2025 - by J.Pauwels
 // - CRITICAL FIX: Fixed TLS disconnection crash by changing from event-driven to direct TLS cleanup
 // - Removed OnBeforeDisconnected := FinalizeTLS assignments from constructors and SetUseTLS
@@ -65,6 +68,7 @@ uses
   System.Math,
   System.TimeSpan,
   System.SyncObjs,
+  System.ZLib, // For compression support
   Generics.Collections,
   {$IFDEF MSWINDOWS}
   Winapi.Windows,
@@ -77,7 +81,9 @@ uses
   ncSocketList,
   ncLines,
   ncThreads,
-  ncCommandPacking; // For TncCommand type
+  ncCommandPacking, // For TncCommand type
+  ncCompression,    // For compression utilities
+  ncEncryption;     // For encryption utilities
 
 type
   // TLS Provider enumeration (declared early for use in constants)
@@ -122,6 +128,12 @@ const
   DefUseTLS = False;
   DefTlsProvider = tpSChannel;
   DefIgnoreCertificateErrors = False;
+  
+  // Compression and Encryption defaults (same as ncSources)
+  DefCompression = zcNone;
+  DefEncryption = etNoEncryption;
+  DefEncryptionKey = 'SetEncryptionKey';
+  DefEncryptOnHashedKey = True;
   
   // Thread Pool Constants (from ncSources)
   DefCommandProcessorThreadPriority = ntpNormal;
@@ -249,6 +261,12 @@ type
     FIgnoreCertificateErrors: Boolean;
     FIsServer: Boolean;
     
+    // Compression and Encryption Properties (same as ncSources)
+    FCompression: TZCompressionLevel;
+    FEncryption: TEncryptorType;
+    FEncryptionKey: AnsiString;
+    FEncryptOnHashedKey: Boolean;
+    
     function GetReadBufferLen: Integer;
     procedure SetReadBufferLen(const Value: Integer);
     function GetActive: Boolean; virtual; abstract;
@@ -282,6 +300,16 @@ type
     procedure SetCACertificatesFile(const Value: string);
     function GetIgnoreCertificateErrors: Boolean;
     procedure SetIgnoreCertificateErrors(const Value: Boolean);
+    
+    // Compression and Encryption Property Methods (same as ncSources)
+    function GetCompression: TZCompressionLevel;
+    procedure SetCompression(const Value: TZCompressionLevel);
+    function GetEncryption: TEncryptorType;
+    procedure SetEncryption(const Value: TEncryptorType);
+    function GetEncryptionKey: AnsiString;
+    procedure SetEncryptionKey(const Value: AnsiString);
+    function GetEncryptOnHashedKey: Boolean;
+    procedure SetEncryptOnHashedKey(const Value: Boolean);
     
     // Thread Pool Property Methods (from ncSources)
     function GetCommandProcessorThreadPriority: TncThreadPriority;
@@ -348,6 +376,12 @@ type
     property PrivateKeyPassword: string read GetPrivateKeyPassword write SetPrivateKeyPassword;
     property CACertificatesFile: string read GetCACertificatesFile write SetCACertificatesFile;
     property IgnoreCertificateErrors: Boolean read GetIgnoreCertificateErrors write SetIgnoreCertificateErrors default DefIgnoreCertificateErrors;
+    
+    // Compression and Encryption Properties (same as ncSources)
+    property Compression: TZCompressionLevel read GetCompression write SetCompression default DefCompression;
+    property Encryption: TEncryptorType read GetEncryption write SetEncryption default DefEncryption;
+    property EncryptionKey: AnsiString read GetEncryptionKey write SetEncryptionKey;
+    property EncryptOnHashedKey: Boolean read GetEncryptOnHashedKey write SetEncryptOnHashedKey default DefEncryptOnHashedKey;
   published
   end;
 
@@ -445,6 +479,12 @@ type
     property PrivateKeyPassword;
     property CACertificatesFile;
     property IgnoreCertificateErrors;
+    
+    // Compression and Encryption Properties
+    property Compression;
+    property Encryption;
+    property EncryptionKey;
+    property EncryptOnHashedKey;
   end;
 
   TncClientProcessor = class(TncReadyThread)
@@ -526,6 +566,12 @@ type
     property PrivateKeyPassword;
     property CACertificatesFile;
     property IgnoreCertificateErrors;
+    
+    // Compression and Encryption Properties
+    property Compression;
+    property Encryption;
+    property EncryptionKey;
+    property EncryptOnHashedKey;
   end;
 
   TncServerProcessor = class(TncReadyThread)
@@ -734,6 +780,12 @@ begin
   FPrivateKeyPassword := '';
   FCACertificatesFile := '';
   FIgnoreCertificateErrors := DefIgnoreCertificateErrors;
+  
+  // Initialize Compression and Encryption properties (same as ncSources)
+  FCompression := DefCompression;
+  FEncryption := DefEncryption;
+  FEncryptionKey := DefEncryptionKey;
+  FEncryptOnHashedKey := DefEncryptOnHashedKey;
   
   FIsServer := False;
 
@@ -1167,6 +1219,88 @@ begin
   end;
 end;
 
+// Compression and Encryption Property Implementations (same as ncSources)
+
+function TncTCPBaseDual.GetCompression: TZCompressionLevel;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FCompression;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetCompression(const Value: TZCompressionLevel);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FCompression := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+function TncTCPBaseDual.GetEncryption: TEncryptorType;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FEncryption;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetEncryption(const Value: TEncryptorType);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FEncryption := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+function TncTCPBaseDual.GetEncryptionKey: AnsiString;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FEncryptionKey;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetEncryptionKey(const Value: AnsiString);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FEncryptionKey := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+function TncTCPBaseDual.GetEncryptOnHashedKey: Boolean;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FEncryptOnHashedKey;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetEncryptOnHashedKey(const Value: Boolean);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FEncryptOnHashedKey := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
 // TLS base implementation
 
 function TncTCPBaseDual.GetHost: string;
@@ -1592,6 +1726,16 @@ begin
   
   // Convert to bytes like ncSources
   MessageBytes := Command.ToBytes;
+  
+  // Apply compression and encryption (same order as ncSources)
+  // Step 1: Encrypt first (if enabled)
+  if Encryption <> etNoEncryption then
+    MessageBytes := EncryptBytes(MessageBytes, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+    
+  // Step 2: Compress second (if enabled)  
+  if Compression <> zcNone then
+    MessageBytes := CompressBytes(MessageBytes, Compression);
+    
   MsgByteCount := Length(MessageBytes);
   
   // Use ncSources protocol format: [Magic: 4][MessageLength: 8][Data: variable]
@@ -1667,7 +1811,19 @@ begin
             begin
               // Process binary command - Route to Thread Pool (from ncSources)
               try
-                Command.FromBytes(FConnectionState.MessageBuffer);
+                // Apply decompression and decryption (reverse order of sending)
+                var ProcessedData := FConnectionState.MessageBuffer;
+                
+                // Step 1: Decompress first (reverse order)
+                if Compression <> zcNone then
+                  ProcessedData := DecompressBytes(ProcessedData);
+                  
+                // Step 2: Decrypt second
+                if Encryption <> etNoEncryption then
+                  ProcessedData := DecryptBytes(ProcessedData, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+                
+                // Parse the processed data
+                Command.FromBytes(ProcessedData);
                 
                 // Route to thread pool for processing like ncSources
                 TMonitor.Enter(HandleCommandThreadPool);
@@ -1685,7 +1841,7 @@ begin
                   TMonitor.Exit(HandleCommandThreadPool);
                 end;
               except
-                // If parsing fails, treat as text
+                // If decompression/decryption/parsing fails, treat as text
                 if Assigned(OriginalOnReadData) then
                   OriginalOnReadData(Self, aLine, FConnectionState.MessageBuffer, Length(FConnectionState.MessageBuffer));
               end;
@@ -2277,6 +2433,16 @@ begin
   
   // Convert to bytes like ncSources
   MessageBytes := Command.ToBytes;
+  
+  // Apply compression and encryption (same order as ncSources)
+  // Step 1: Encrypt first (if enabled)
+  if Encryption <> etNoEncryption then
+    MessageBytes := EncryptBytes(MessageBytes, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+    
+  // Step 2: Compress second (if enabled)  
+  if Compression <> zcNone then
+    MessageBytes := CompressBytes(MessageBytes, Compression);
+    
   MsgByteCount := Length(MessageBytes);
   
   // Use ncSources protocol format: [Magic: 4][MessageLength: 8][Data: variable]
@@ -2360,7 +2526,19 @@ begin
             begin
               // Process binary command - Route to Thread Pool (from ncSources)
               try
-                Command.FromBytes(ConnectionState.MessageBuffer);
+                // Apply decompression and decryption (reverse order of sending)
+                var ProcessedData := ConnectionState.MessageBuffer;
+                
+                // Step 1: Decompress first (reverse order)
+                if Compression <> zcNone then
+                  ProcessedData := DecompressBytes(ProcessedData);
+                  
+                // Step 2: Decrypt second
+                if Encryption <> etNoEncryption then
+                  ProcessedData := DecryptBytes(ProcessedData, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+                
+                // Parse the processed data
+                Command.FromBytes(ProcessedData);
                 
                 // Route to thread pool for processing like ncSources
                 TMonitor.Enter(HandleCommandThreadPool);
@@ -2378,7 +2556,7 @@ begin
                   TMonitor.Exit(HandleCommandThreadPool);
                 end;
               except
-                // If parsing fails, treat as text
+                // If decompression/decryption/parsing fails, treat as text
                 if Assigned(OriginalOnReadData) then
                   OriginalOnReadData(Self, aLine, ConnectionState.MessageBuffer, Length(ConnectionState.MessageBuffer));
               end;
