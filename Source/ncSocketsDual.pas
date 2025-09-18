@@ -86,6 +86,7 @@ type
     tpOpenSSL       // OpenSSL (cross-platform, requires OpenSSL DLLs)
   );
 
+{$IFDEF MSWINDOWS}
   // Forward declarations for SChannel types
   PSChannelClient = ^TSChannelClient;
   PSChannelServer = ^TSChannelServer;
@@ -103,6 +104,7 @@ type
     function GetServerContext: PSChannelServer;
     property IsServer: Boolean read FIsServer;
   end;
+{$ENDIF}
 
   // Protocol magic header type (same as ncSources)
   TMagicHeaderType = UInt32;
@@ -655,6 +657,7 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
 // ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 { TncTlsConnectionContext }
 // ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -698,6 +701,7 @@ function TncTlsConnectionContext.GetServerContext: PSChannelServer;
 begin
   Result := @FServerContext;
 end;
+{$ENDIF}
 
 // ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 { TncTCPBaseDual }
@@ -1177,6 +1181,7 @@ begin
 end;
 
 // TLS Functionality Methods
+{$IFDEF MSWINDOWS}
 procedure TncTCPBaseDual.InitializeTLS(aLine: TncLine);
 var
   TlsContext: TncTlsConnectionContext;
@@ -1220,6 +1225,13 @@ begin
     TlsContext.GetClientContext^.AfterConnection(aLine, AnsiString(GetHost), FIgnoreCertificateErrors);
   end;
 end;
+{$ELSE}
+procedure TncTCPBaseDual.InitializeTLS(aLine: TncLine);
+begin
+  if FUseTLS then
+    raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr);
+end;
+{$ENDIF}
 
 procedure TncTCPBaseDual.HandleTLSHandshake(aLine: TncLine);
 begin
@@ -1245,6 +1257,7 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
 procedure TncTCPBaseDual.FinalizeTLS(aLine: TncLine);
 var
   TlsContext: TncTlsConnectionContext;
@@ -1257,7 +1270,6 @@ begin
       case FTlsProvider of
         tpSChannel:
           begin
-            {$IFDEF MSWINDOWS}
             if FIsServer then
             begin
               if TlsContext.GetServerContext^.Initialized then
@@ -1268,7 +1280,6 @@ begin
               if TlsContext.GetClientContext^.Initialized then
                 TlsContext.GetClientContext^.BeforeDisconnection(aLine);
             end;
-            {$ENDIF}
           end;
         tpOpenSSL:
           begin
@@ -1285,7 +1296,14 @@ begin
     end;
   end;
 end;
+{$ELSE}
+procedure TncTCPBaseDual.FinalizeTLS(aLine: TncLine);
+begin
+  // No TLS cleanup needed on non-Windows platforms
+end;
+{$ENDIF}
 
+{$IFDEF MSWINDOWS}
 function TncTCPBaseDual.SendTLS(aLine: TncLine; const aBuf; aBufSize: Integer): Integer;
 var
   TlsContext: TncTlsConnectionContext;
@@ -1297,7 +1315,6 @@ begin
     case FTlsProvider of
       tpSChannel:
         begin
-          {$IFDEF MSWINDOWS}
           if FIsServer then
           begin
             if TlsContext.GetServerContext^.Initialized then
@@ -1312,9 +1329,6 @@ begin
             else
               Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
           end;
-          {$ELSE}
-          raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr);
-          {$ENDIF}
         end;
       tpOpenSSL:
         begin
@@ -1326,7 +1340,17 @@ begin
   else
     Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
 end;
+{$ELSE}
+function TncTCPBaseDual.SendTLS(aLine: TncLine; const aBuf; aBufSize: Integer): Integer;
+begin
+  if FUseTLS then
+    raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr)
+  else
+    Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
+end;
+{$ENDIF}
 
+{$IFDEF MSWINDOWS}
 function TncTCPBaseDual.ReceiveTLS(aLine: TncLine; var aBuf; aBufSize: Integer): Integer;
 var
   TlsContext: TncTlsConnectionContext;
@@ -1339,7 +1363,6 @@ begin
     case FTlsProvider of
       tpSChannel:
         begin
-          {$IFDEF MSWINDOWS}
           if FIsServer then
           begin
             if TlsContext.GetServerContext^.Initialized then
@@ -1393,9 +1416,6 @@ begin
             else
               Result := TncLineInternal(aLine).RecvBuffer(aBuf, aBufSize);
           end;
-          {$ELSE}
-          raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr);
-          {$ENDIF}
         end;
       tpOpenSSL:
         begin
@@ -1407,6 +1427,15 @@ begin
   else
     Result := TncLineInternal(aLine).RecvBuffer(aBuf, aBufSize);
 end;
+{$ELSE}
+function TncTCPBaseDual.ReceiveTLS(aLine: TncLine; var aBuf; aBufSize: Integer): Integer;
+begin
+  if FUseTLS then
+    raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr)
+  else
+    Result := TncLineInternal(aLine).RecvBuffer(aBuf, aBufSize);
+end;
+{$ENDIF}
 
 // ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 { TncCustomTCPClientDual }
@@ -1618,6 +1647,7 @@ begin
   // TLS handshake data should never reach the application layer
   if UseTLS then
   begin
+    {$IFDEF MSWINDOWS}
     // Check if TLS handshake is still in progress using per-connection context
     if (TncLineInternal(aLine).DataObject <> nil) then
     begin
@@ -1631,6 +1661,7 @@ begin
         Exit; // Don't process for protocol detection during handshake
       end;
     end;
+    {$ENDIF}
     // If we reach here, TLS handshake is complete and data is decrypted application data
     // Continue with normal protocol detection below
   end;
@@ -2303,6 +2334,7 @@ begin
   // TLS handshake data should never reach the application layer
   if UseTLS then
   begin
+    {$IFDEF MSWINDOWS}
     // Check if TLS handshake is still in progress using per-connection context
     if (TncLineInternal(aLine).DataObject <> nil) then
     begin
@@ -2316,6 +2348,7 @@ begin
         Exit; // Don't process for protocol detection during handshake
       end;
     end;
+    {$ENDIF}
     // If we reach here, TLS handshake is complete and data is decrypted application data
     // Continue with normal protocol detection below
   end;

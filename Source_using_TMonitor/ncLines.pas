@@ -74,6 +74,8 @@ const
   InvalidSocket = -1;
   SocketError = -1;
   IPPROTO_TCP = 6;
+  IPPROTO_UDP = 17;
+  IPPROTO_IPV6 = 41;
   TCP_NODELAY = $0001;
   ETIMEDOUT = 110;
   ECONNREFUSED = 111;
@@ -338,30 +340,6 @@ begin
   Result := Length(Readable(aSocketHandleArray, aTimeout)) > 0;
 end;
 
-{$IFDEF MSWINDOWS}
-
-var
-  DllGetAddrInfo: TGetAddrInfoW = nil;
-  DllFreeAddrInfo: TFreeAddrInfoW = nil;
-
-procedure GetAddressInfo(NodeName: PWideChar; ServiceName: PWideChar;
-  Hints: PAddrInfoW; ppResult: PPAddrInfoW);
-var
-  iRes: Integer;
-begin
-  if LowerCase(string(NodeName)) = 'localhost' then
-    NodeName := '127.0.0.1';
-
-  iRes := DllGetAddrInfo(NodeName, ServiceName, Hints, ppResult);
-  if iRes <> 0 then
-    raise EncLineException.Create(SysErrorMessage(iRes));
-end;
-
-procedure FreeAddressInfo(ai: PAddrInfoW);
-begin
-  DllFreeAddrInfo(ai);
-end;
-
 function IsBroadcastAddress(const aHost: string): Boolean;
 var
   Octets: TArray<string>;
@@ -385,6 +363,30 @@ begin
     (aHost = '0.0.0.0') or
   // Subnet broadcast (last octet is 255)
     (LastOctet = 255);
+end;
+
+{$IFDEF MSWINDOWS}
+
+var
+  DllGetAddrInfo: TGetAddrInfoW = nil;
+  DllFreeAddrInfo: TFreeAddrInfoW = nil;
+
+procedure GetAddressInfo(NodeName: PWideChar; ServiceName: PWideChar;
+  Hints: PAddrInfoW; ppResult: PPAddrInfoW);
+var
+  iRes: Integer;
+begin
+  if LowerCase(string(NodeName)) = 'localhost' then
+    NodeName := '127.0.0.1';
+
+  iRes := DllGetAddrInfo(NodeName, ServiceName, Hints, ppResult);
+  if iRes <> 0 then
+    raise EncLineException.Create(SysErrorMessage(iRes));
+end;
+
+procedure FreeAddressInfo(ai: PAddrInfoW);
+begin
+  DllFreeAddrInfo(ai);
 end;
 
 {$ENDIF}

@@ -56,6 +56,21 @@ type
   end;
   PSockAddrStorage = ^TSockAddrStorage;
 
+  {$IFNDEF MSWINDOWS}
+  // Define Windows-compatible types for Linux
+  TSockAddrIn = packed record
+    sin_family: Word;
+    sin_port: Word;
+    sin_addr: record
+      S_un_b: record
+        s_b1, s_b2, s_b3, s_b4: Byte;
+      end;
+    end;
+    sin_zero: array[0..7] of Byte;
+  end;
+  PSockAddrIn = ^TSockAddrIn;
+  {$ENDIF}
+
   EIPError = class(Exception);
 
   // Function types for dynamic loading
@@ -199,7 +214,7 @@ begin
       SysErrorMessage(WSAGetLastError));
   {$ELSE}
   if Posix.ArpaInet.inet_ntop(AF_INET6, @Addr, StringBuffer, IPV6_STR_MAX_LEN) = nil then
-    raise EIPv6Error.Create('Failed to convert IPv6 address to string: ' +
+    raise EIPError.Create('Failed to convert IPv6 address to string: ' +
       SysErrorMessage(GetLastError));
   {$ENDIF}
 
@@ -281,4 +296,5 @@ finalization
   {$ENDIF}
 
 end.
+
 
