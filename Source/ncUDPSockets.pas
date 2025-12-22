@@ -83,7 +83,7 @@ type
     procedure DoActivate(aActivate: Boolean); virtual; abstract;
     procedure SetUseReaderThread(const Value: Boolean);
   protected
-    PropertyLock: TCriticalSection;
+    PropertyLock: TObject; // TMonitor synchronization object
     ReadBuf: TBytes;
     procedure Loaded; override;
     function CreateLineObject: TncLine; virtual;
@@ -219,7 +219,7 @@ constructor TncUDPBase.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
-  PropertyLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
 
   FInitActive := False;
   FFamily := DefFamily;
@@ -261,23 +261,23 @@ end;
 
 procedure TncUDPBase.SetActive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     if not(csLoading in ComponentState) then
       DoActivate(Value);
     FInitActive := GetActive;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBase.GetFamily: TAddressType;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FFamily;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -290,7 +290,7 @@ begin
         (ECannotSetFamilyWhileConnectionIsActiveStr);
   end;
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Update base class family
     FFamily := Value;
@@ -301,17 +301,17 @@ begin
       TncLineInternal(FLine).SetFamily(Value);
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBase.GetPort: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPort;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -321,27 +321,27 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetPortWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPort := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBase.GetReaderThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := ToNcThreadPriority(LineProcessor.Priority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBase.SetReaderThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     try
       LineProcessor.Priority := FromNcThreadPriority(Value);
@@ -349,27 +349,27 @@ begin
       // Some android devices cannot handle changing priority
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBase.GetBroadcast: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FBroadcast;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBase.SetBroadcast(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FBroadcast := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -379,32 +379,32 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetUseReaderThreadWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseReaderThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBase.GetReadBufferLen: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReadBufferLen;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBase.SetReadBufferLen(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReadBufferLen := Value;
     SetLength(ReadBuf, FReadBufferLen);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -519,11 +519,11 @@ end;
 
 function TncCustomUDPClient.GetHost: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FHost;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -533,11 +533,11 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetHostWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FHost := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 

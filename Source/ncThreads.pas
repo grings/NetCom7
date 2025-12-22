@@ -3,6 +3,10 @@ unit ncThreads;
 // /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
 // NetCom7 Package
+//
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // Written by Demos Bill, 17 Nov 2009
 //
 // /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -63,7 +67,6 @@ type
   protected
     Threads: array of TncReadyThread;
   public
-    Serialiser: TCriticalSection;
     constructor Create(aWorkerThreadClass: TncReadyThreadClass);
     destructor Destroy; override;
     function RequestReadyThread: TncReadyThread;
@@ -269,7 +272,6 @@ end;
 
 constructor TncThreadPool.Create(aWorkerThreadClass: TncReadyThreadClass);
 begin
-  Serialiser := TCriticalSection.Create;
   ThreadClass := aWorkerThreadClass;
   FGrowUpto := 500; // can reach up to 500 threads by default
 end;
@@ -277,7 +279,6 @@ end;
 destructor TncThreadPool.Destroy;
 begin
   ShutDown;
-  Serialiser.Free;
   inherited;
 end;
 
@@ -398,31 +399,31 @@ end;
 
 function TncThreadPool.GetGrowUpto: Integer;
 begin
-  Serialiser.Acquire;
+  TMonitor.Enter(Self);
   try
     Result := FGrowUpto;
   finally
-    Serialiser.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
 procedure TncThreadPool.SetGrowUpto(const Value: Integer);
 begin
-  Serialiser.Acquire;
+  TMonitor.Enter(Self);
   try
     FGrowUpto := Value;
   finally
-    Serialiser.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
 function TncThreadPool.GetThreadCount: Integer;
 begin
-  Serialiser.Acquire;
+  TMonitor.Enter(Self);
   try
     Result := Length(Threads);
   finally
-    Serialiser.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
@@ -430,7 +431,7 @@ function TncThreadPool.GetActiveThreadCount: Integer;
 var
   i: Integer;
 begin
-  Serialiser.Acquire;
+  TMonitor.Enter(Self);
   try
     Result := 0;
     for i := 0 to High(Threads) do
@@ -439,7 +440,7 @@ begin
         Inc(Result);
     end;
   finally
-    Serialiser.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 

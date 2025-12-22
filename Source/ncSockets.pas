@@ -7,6 +7,9 @@ unit ncSockets;
 // This unit creates a TCP Server and TCP Client socket, along with their
 // threads dealing with reading from the socket
 //
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // 13/07/2025 - by J.Pauwels
 // - Added TLS implementation support through SChannel integration
 // - Added TLS properties (UseTLS, TlsProvider, CertificateFile) to TncTCPBase
@@ -78,12 +81,12 @@ type
     tpOpenSSL       // OpenSSL (cross-platform, requires OpenSSL DLLs)
   );
 
-{$IFDEF MSWINDOWS}
-  // Forward declarations for SChannel types
+  {$IFDEF MSWINDOWS}
+  // Forward declarations for SChannel types (Windows only)
   PSChannelClient = ^TSChannelClient;
   PSChannelServer = ^TSChannelServer;
 
-  // Per-connection TLS context storage
+  // Per-connection TLS context storage (Windows only)
   TncTlsConnectionContext = class
   private
     FIsServer: Boolean;
@@ -96,7 +99,7 @@ type
     function GetServerContext: PSChannelServer;
     property IsServer: Boolean read FIsServer;
   end;
-{$ENDIF}
+  {$ENDIF}
 
 const
   DefPort = 16233;
@@ -151,7 +154,6 @@ type
   private
     FList: TSocketList;
     FListCopy: TSocketList;
-    FLock: TCriticalSection;
     FLockCount: Integer;
   protected
     procedure Add(const Item: TncLine); inline;
@@ -236,11 +238,11 @@ type
 
   private
     FUseReaderThread: Boolean;
+    PropertyLock, ShutDownLock: TObject; // TMonitor synchronization objects
+    ReadBuf: TBytes;
     procedure DoActivate(aActivate: Boolean); virtual; abstract;
     procedure SetUseReaderThread(const Value: Boolean);
   protected
-    PropertyLock, ShutDownLock: TCriticalSection;
-    ReadBuf: TBytes;
     procedure Loaded; override;
     function CreateLineObject: TncLine; virtual;
     function GetHost: string; virtual; // Virtual method for TLS
@@ -432,7 +434,6 @@ implementation
 constructor TThreadLineList.Create;
 begin
   inherited Create;
-  FLock := TCriticalSection.Create;
   FList := TSocketList.Create;
   FLockCount := 0;
 end;
@@ -445,7 +446,6 @@ begin
     inherited Destroy;
   finally
     UnlockListNoCopy;
-    FLock.Free;
   end;
 end;
 
@@ -483,18 +483,18 @@ end;
 
 function TThreadLineList.LockListNoCopy: TSocketList;
 begin
-  FLock.Acquire;
+  TMonitor.Enter(Self);
   Result := FList;
 end;
 
 procedure TThreadLineList.UnlockListNoCopy;
 begin
-  FLock.Release;
+  TMonitor.Exit(Self);
 end;
 
 function TThreadLineList.LockList: TSocketList;
 begin
-  FLock.Acquire;
+  TMonitor.Enter(Self);
   try
     if FLockCount = 0 then
     begin
@@ -505,13 +505,13 @@ begin
 
     FLockCount := FLockCount + 1;
   finally
-    FLock.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
 procedure TThreadLineList.UnlockList;
 begin
-  FLock.Acquire;
+  TMonitor.Enter(Self);
   try
     if FLockCount = 0 then
       raise Exception.Create('Cannot unlock a non-locked list');
@@ -521,7 +521,7 @@ begin
     if FLockCount = 0 then
       FListCopy.Free;
   finally
-    FLock.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
@@ -543,32 +543,6 @@ begin
   FServerContext.Initialized := False;
   FServerContext.HandshakeCompleted := False;
 end;
-
-{
-destructor TncTlsConnectionContext.Destroy;
-begin
-  // Clean up TLS contexts
-  try
-    if FIsServer then
-    begin
-      if FServerContext.Initialized then
-      begin
-        // Context cleanup will be handled by BeforeDisconnection call
-      end;
-    end
-    else
-    begin
-      if FClientContext.Initialized then
-      begin
-        // Context cleanup will be handled by BeforeDisconnection call
-      end;
-    end;
-  except
-    // Ignore cleanup errors
-  end;
-
-  inherited Destroy;
-end;}
 
 destructor TncTlsConnectionContext.Destroy;
 begin
@@ -606,8 +580,8 @@ constructor TncTCPBase.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
-  PropertyLock := TCriticalSection.Create;
-  ShutDownLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
+  ShutDownLock := TObject.Create;
 
   FInitActive := False;
   FFamily := DefFamily;
@@ -660,6 +634,7 @@ begin
 
   PropertyLock.Free;
   ShutDownLock.Free;
+
   inherited Destroy;
 end;
 
@@ -684,24 +659,24 @@ end;
 
 procedure TncTCPBase.SetActive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     if not(csLoading in ComponentState) then
       DoActivate(Value);
 
     FInitActive := GetActive; // we only care here for the loaded event
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetFamily: TAddressType;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FFamily;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -713,7 +688,7 @@ begin
       raise EPropertySetError.Create(ECannotSetFamilyWhileConnectionIsActiveStr);
   end;
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Update base class family
     FFamily := Value;
@@ -724,17 +699,17 @@ begin
       TncLineInternal(FLine).SetFamily(Value);
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetPort: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPort;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -744,27 +719,27 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetPortWhileConnectionIsActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPort := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetReaderThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := ToNcThreadPriority(LineProcessor.Priority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetReaderThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     try
       LineProcessor.Priority := FromNcThreadPriority(Value);
@@ -772,27 +747,27 @@ begin
       // Some android devices cannot handle changing priority
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetEventsUseMainThread: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FEventsUseMainThread;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetEventsUseMainThread(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FEventsUseMainThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -802,85 +777,85 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetUseReaderThreadWhileActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseReaderThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetNoDelay: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FNoDelay;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetNoDelay(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FNoDelay := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetKeepAlive: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FKeepAlive;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetKeepAlive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FKeepAlive := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 // Update
 function TncTCPBase.GetReadBufferLen: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReadBufferLen;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 // Update
 procedure TncTCPBase.SetReadBufferLen(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReadBufferLen := Value;
     SetLength(ReadBuf, FReadBufferLen);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 // TLS Property Methods
 function TncTCPBase.GetUseTLS: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FUseTLS;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -890,7 +865,7 @@ begin
     if Active then
       raise EPropertySetError.Create('Cannot set UseTLS property whilst the connection is active');
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseTLS := Value;
 
@@ -917,17 +892,17 @@ begin
       end;
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetTlsProvider: TncTlsProvider;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FTlsProvider;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -937,7 +912,7 @@ begin
     if Active then
       raise EPropertySetError.Create('Cannot set TlsProvider property whilst the connection is active');
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Validate provider availability
     case Value of
@@ -956,107 +931,107 @@ begin
 
     FTlsProvider := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetCertificateFile: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCertificateFile;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetCertificateFile(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCertificateFile := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetPrivateKeyFile: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPrivateKeyFile;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetPrivateKeyFile(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPrivateKeyFile := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetPrivateKeyPassword: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPrivateKeyPassword;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetPrivateKeyPassword(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPrivateKeyPassword := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetCACertificatesFile: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCACertificatesFile;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetCACertificatesFile(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCACertificatesFile := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBase.GetIgnoreCertificateErrors: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FIgnoreCertificateErrors;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBase.SetIgnoreCertificateErrors(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FIgnoreCertificateErrors := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1066,8 +1041,8 @@ begin
   Result := ''; // Default implementation, override in client
 end;
 
-// TLS Functionality Methods
 {$IFDEF MSWINDOWS}
+// TLS Functionality Methods
 procedure TncTCPBase.InitializeTLS(aLine: TncLine);
 var
   TlsContext: TncTlsConnectionContext;
@@ -1112,8 +1087,10 @@ begin
   end;
 end;
 {$ELSE}
+// TLS Functionality Methods - Linux stub
 procedure TncTCPBase.InitializeTLS(aLine: TncLine);
 begin
+  // TLS not supported on Linux yet
   if FUseTLS then
     raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr);
 end;
@@ -1185,7 +1162,7 @@ end;
 {$ELSE}
 procedure TncTCPBase.FinalizeTLS(aLine: TncLine);
 begin
-  // No TLS cleanup needed on non-Windows platforms
+  // TLS not supported on Linux yet - no cleanup needed
 end;
 {$ENDIF}
 
@@ -1511,11 +1488,11 @@ end;
 
 function TncCustomTCPClient.GetHost: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FHost;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1525,51 +1502,51 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetHostWhileConnectionIsActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FHost := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncCustomTCPClient.GetReconnect: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReconnect;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncCustomTCPClient.SetReconnect(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReconnect := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncCustomTCPClient.GetReconnectInterval: Cardinal;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReconnectInterval;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncCustomTCPClient.SetReconnectInterval(const Value: Cardinal);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReconnectInterval := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1643,7 +1620,7 @@ begin
             FClientSocket.LastConnectAttempt := TStopWatch.GetTimeStamp;
 
             WasReconnected := False;
-            FClientSocket.PropertyLock.Acquire;
+            TMonitor.Enter(FClientSocket.PropertyLock);
             try
               if not FClientSocket.Active then
               begin
@@ -1658,7 +1635,7 @@ begin
                 end;
               end;
             finally
-              FClientSocket.PropertyLock.Release;
+              TMonitor.Exit(FClientSocket.PropertyLock);
             end;
             if WasReconnected then
               if FClientSocket.EventsUseMainThread then
@@ -1781,7 +1758,7 @@ var
 begin
   if UseReaderThread then
   begin
-    ShutDownLock.Acquire;
+    TMonitor.Enter(ShutDownLock);
     try
       for i := 0 to High(LinesToShutDown) do
         if LinesToShutDown[i] = aLine then
@@ -1790,7 +1767,7 @@ begin
       SetLength(LinesToShutDown, Length(LinesToShutDown) + 1);
       LinesToShutDown[High(LinesToShutDown)] := aLine;
     finally
-      ShutDownLock.Release;
+      TMonitor.Exit(ShutDownLock);
     end;
   end
   else
@@ -1869,7 +1846,7 @@ begin
       FinalizeTLS(aLine);
 
     // First remove the handle to prevent further processing
-    PropertyLock.Acquire;
+    TMonitor.Enter(PropertyLock);
     try
       for i := 0 to High(ReadSocketHandles) do
         if ReadSocketHandles[i] = aLine.Handle then
@@ -1879,7 +1856,7 @@ begin
           Break;
         end;
     finally
-      PropertyLock.Release;
+      TMonitor.Exit(PropertyLock);
     end;
 
     // Then handle disconnect event
@@ -1978,9 +1955,9 @@ var
 begin
   // The list may be locked from custom code executed in the OnReadData handler
   // So we will not delete anything, or lock the list, until this lock is freed
-  if FServerSocket.Lines.FLock.TryEnter then
+  if TMonitor.TryEnter(FServerSocket.Lines) then
     try
-      FServerSocket.ShutDownLock.Acquire;
+      TMonitor.Enter(FServerSocket.ShutDownLock);
       try
         for i := 0 to High(FServerSocket.LinesToShutDown) do
           try
@@ -1991,10 +1968,10 @@ begin
           end;
         SetLength(FServerSocket.LinesToShutDown, 0);
       finally
-        FServerSocket.ShutDownLock.Release;
+        TMonitor.Exit(FServerSocket.ShutDownLock);
       end;
     finally
-      FServerSocket.Lines.FLock.Leave;
+      TMonitor.Exit(FServerSocket.Lines);
     end;
 end;
 
@@ -2101,6 +2078,3 @@ begin
 end;
 
 end.
-
-
-

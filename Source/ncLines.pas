@@ -6,6 +6,9 @@
 // socket, organised in an object which contains the handle of the socket,
 // and also makes sure it checks every API command for errors
 //
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // 13/07/2025 - by J.Pauwels
 // - Added TLS handshake callback integration through OnBeforeConnected architecture
 // - Integrated TLS support into line-level socket operations
@@ -150,7 +153,7 @@ type
     FOnBeforeConnected: TncLineOnConnectDisconnect; // Called before OnConnected for TLS setup
     FOnBeforeDisconnected: TncLineOnConnectDisconnect; // Called before OnDisconnected for TLS cleanup
   private
-    PropertyLock: TCriticalSection;
+    PropertyLock: TObject; // TMonitor synchronization object
     FHandle: TSocketHandle;
     FConnectTimeout: Integer;
 
@@ -337,7 +340,6 @@ begin
   Result := Length(Readable(aSocketHandleArray, aTimeout)) > 0;
 end;
 
-
 function IsBroadcastAddress(const aHost: string): Boolean;
 var
   Octets: TArray<string>;
@@ -388,7 +390,6 @@ begin
 end;
 
 {$ENDIF}
-
 // ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 { TncLine }
 // ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -397,7 +398,7 @@ constructor TncLine.Create;
 begin
   inherited Create;
 
-  PropertyLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
   FHandle := InvalidSocket;
   FKind := DefaultKind;
   FFamily := DefaultFamily;
@@ -1023,41 +1024,41 @@ end;
 
 function TncLine.GetLastReceived: Int64;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FLastReceived;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncLine.SetLastReceived(const Value: Int64);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FLastReceived := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncLine.GetLastSent: Int64;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FLastSent;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncLine.SetLastSent(const Value: Int64);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FLastSent := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 

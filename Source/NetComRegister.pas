@@ -4,7 +4,7 @@ interface
 
 uses
   WinApi.Windows, System.Classes, System.SysUtils, ToolsAPI, DesignIntf, DesignEditors,
-  ncSockets, ncSocketsDual, ncSources, ncSocketsThd, ncCommandHandlers, ncDBSrv, ncDBCnt, 
+  ncSockets, ncSocketsDual, ncSources, ncSocketsThd, ncCommandHandlers, ncDBSrv, ncDBCnt,
   ncUDPSockets, ncUDPSocketsLCP, ncUDPSocketsDual;
 
 type
@@ -206,7 +206,7 @@ end;
 
 procedure TncUDPSocketDualDefaultEditor.EditProperty(const Prop: IProperty; var Continue: Boolean);
 begin
-  if (CompareText(Prop.GetName, 'ONREADDATAGRAM') = 0) or 
+  if (CompareText(Prop.GetName, 'ONREADDATAGRAM') = 0) or
      (CompareText(Prop.GetName, 'ONCOMMAND') = 0) then
   begin
     Prop.Edit;
@@ -237,3 +237,4 @@ finalization
   UnregisterAboutBox;
 
 end.
+

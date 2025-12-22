@@ -444,11 +444,11 @@ type
     Sizes: TSecPkgContextStreamSizes;
     Data, Input: AnsiString;
     InputSize, DataPos, DataCount, InputCount: integer;
-    SessionClosed: boolean;
     procedure HandshakeLoop(aLine: TObject);
     procedure AppendData(const aBuffer: TSecBuffer);
   public
     Initialized: boolean;
+    SessionClosed: boolean;
     procedure AfterConnection(aLine: TObject; const aTargetHost: AnsiString; aIgnoreCertificateErrors: boolean);
     procedure BeforeDisconnection(aLine: TObject);
     function Receive(aLine: TObject; aBuffer: pointer; aLength: integer): integer;
@@ -464,12 +464,12 @@ type
     Sizes: TSecPkgContextStreamSizes;
     Data, Input: AnsiString;
     InputSize, DataPos, DataCount, InputCount: integer;
-    SessionClosed: boolean;
     procedure HandshakeLoop(aLine: TObject);
     procedure AppendData(const aBuffer: TSecBuffer);
   public
     Initialized: boolean;
     HandshakeCompleted: boolean;
+    SessionClosed: boolean;
     procedure AfterConnection(aLine: TObject; const aCertificateFile, aPrivateKeyPassword: AnsiString);
     procedure BeforeDisconnection(aLine: TObject);
     function Receive(aLine: TObject; aBuffer: pointer; aLength: integer): integer;
@@ -960,6 +960,7 @@ var
   end;
 begin
   Line := TncLine(aLine);
+
   if not Initialized then begin // use plain socket API
     result := TncLineInternal(Line).RecvBuffer(aBuffer^, aLength);
     exit;
@@ -975,6 +976,7 @@ begin
       repeat
         read := TncLineInternal(Line).RecvBuffer(PByteArray(Input)[InputCount], InputSize - InputCount);
         if read <= 0 then begin
+          SessionClosed := true; // Mark session as closed when recv returns <= 0
           result := read; // return socket error
           exit;
         end;
@@ -985,23 +987,18 @@ begin
       repeat
         case res of
           SEC_I_RENEGOTIATE:
-            begin
-              needsRenegotiate := true;
-            end;
+            needsRenegotiate := true;
           SEC_I_CONTEXT_EXPIRED:
-            begin
-              SessionClosed := true;
-            end;
-          SEC_E_INCOMPLETE_MESSAGE: break;
+            SessionClosed := true;
+          SEC_E_INCOMPLETE_MESSAGE:
+            break;
           else CheckSEC_E_OK(res);
         end;
         InputCount := 0;
         for i := 1 to 3 do
           case buf[i].BufferType of
             SECBUFFER_DATA:
-              begin
-                AppendData(buf[i]);
-              end;
+              AppendData(buf[i]);
             SECBUFFER_EXTRA:
               begin
                 Move(buf[i].pvBuffer^, pointer(Input)^, buf[i].cbBuffer);
@@ -1013,12 +1010,14 @@ begin
         res := DecryptInput;
       until false;
       if needsRenegotiate then
-      begin
         HandshakeLoop(aLine);
-      end;
     except
       on E: Exception do
       begin
+        // CRITICAL FIX: Reset InputCount to clear corrupted TLS data from buffer
+        // Without this, corrupted data accumulates and causes repeated decryption failures
+        InputCount := 0;
+        SessionClosed := true; // Mark session as closed on exception
         exit; // shutdown the connection on ESChannel fatal error
       end;
     end;
@@ -1369,6 +1368,7 @@ var
   end;
 begin
   Line := TncLine(aLine);
+
   if not Initialized then begin // use plain socket API
     result := TncLineInternal(Line).RecvBuffer(aBuffer^, aLength);
     exit;
@@ -1416,6 +1416,7 @@ begin
       repeat
         read := TncLineInternal(Line).RecvBuffer(PByteArray(Input)[InputCount], InputSize - InputCount);
         if read <= 0 then begin
+          SessionClosed := true; // Mark session as closed when recv returns <= 0
           result := read; // return socket error
           exit;
         end;
@@ -1426,24 +1427,23 @@ begin
       repeat
         case res of
           SEC_I_RENEGOTIATE:
-            begin
-              needsRenegotiate := true;
-            end;
+            needsRenegotiate := true;
           SEC_I_CONTEXT_EXPIRED:
-            begin
-              SessionClosed := true;
-            end;
-          SEC_E_INCOMPLETE_MESSAGE: break;
+            SessionClosed := true;
+          SEC_E_INCOMPLETE_MESSAGE:
+            break;
           else CheckSEC_E_OK(res);
         end;
         InputCount := 0;
         for i := 1 to 3 do
           case buf[i].BufferType of
-            SECBUFFER_DATA: AppendData(buf[i]);
-            SECBUFFER_EXTRA: begin
-              Move(buf[i].pvBuffer^, pointer(Input)^, buf[i].cbBuffer);
-              InputCount := buf[i].cbBuffer;
-            end;
+            SECBUFFER_DATA:
+              AppendData(buf[i]);
+            SECBUFFER_EXTRA:
+              begin
+                Move(buf[i].pvBuffer^, pointer(Input)^, buf[i].cbBuffer);
+                InputCount := buf[i].cbBuffer;
+              end;
           end;
         if InputCount = 0 then
           break;
@@ -1452,7 +1452,14 @@ begin
       if needsRenegotiate then
         HandshakeLoop(aLine);
     except
-      exit; // shutdown the connection on ESChannel fatal error
+      on E: Exception do
+      begin
+        // CRITICAL FIX: Reset InputCount to clear corrupted TLS data from buffer
+        // Without this, corrupted data accumulates and causes repeated decryption failures
+        InputCount := 0;
+        SessionClosed := true; // Mark session as closed on exception
+        exit; // shutdown the connection on ESChannel fatal error
+      end;
     end;
   result := DataCount;
   if aLength < result then

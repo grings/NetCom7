@@ -31,6 +31,9 @@ unit ncSocketsDual;
 // - Added direct FinalizeTLS(aLine) calls in DataSocketDisconnected methods for better timing
 // - This aligns ncSocketsDual TLS cleanup pattern with the proven ncSockets approach
 //
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // 15/07/2025 - by J.Pauwels
 // - CRITICAL FIX: Implemented per-connection TLS context storage to support multiple concurrent TLS connections
 // - Fixed TLS multiple client connection issue using TncTlsConnectionContext class
@@ -65,6 +68,7 @@ uses
   System.Math,
   System.TimeSpan,
   System.SyncObjs,
+  System.ZLib, // For compression support
   Generics.Collections,
   {$IFDEF MSWINDOWS}
   Winapi.Windows,
@@ -77,7 +81,9 @@ uses
   ncSocketList,
   ncLines,
   ncThreads,
-  ncCommandPacking; // For TncCommand type
+  ncCommandPacking, // For TncCommand type
+  ncCompression,    // For compression utilities
+  ncEncryption;     // For encryption utilities
 
 type
   // TLS Provider enumeration (declared early for use in constants)
@@ -97,9 +103,12 @@ type
     FIsServer: Boolean;
     FClientContext: TSChannelClient;
     FServerContext: TSChannelServer;
+    FLock: TObject;  // CRITICAL FIX: Thread-safe lock for concurrent Send/Receive
   public
     constructor Create(aIsServer: Boolean);
     destructor Destroy; override;
+    procedure Lock;    // Lock before TLS operations
+    procedure Unlock;  // Unlock after TLS operations
     function GetClientContext: PSChannelClient;
     function GetServerContext: PSChannelServer;
     property IsServer: Boolean read FIsServer;
@@ -124,13 +133,19 @@ const
   DefUseTLS = False;
   DefTlsProvider = tpSChannel;
   DefIgnoreCertificateErrors = False;
-  
+
+  // Compression and Encryption defaults (same as ncSources)
+  DefCompression = zcNone;
+  DefEncryption = etNoEncryption;
+  DefEncryptionKey = 'SetEncryptionKey';
+  DefEncryptOnHashedKey = True;
+
   // Thread Pool Constants (from ncSources)
   DefCommandProcessorThreadPriority = ntpNormal;
   DefCommandProcessorThreads = 0;
   DefCommandProcessorThreadsPerCPU = 4;
   DefCommandProcessorThreadsGrowUpto = 32;
-  
+
   // Protocol magic header (same as ncSources)
   MagicHeader: TMagicHeaderType = $ACF0FF00;
 
@@ -172,7 +187,7 @@ type
   private
     FList: TSocketList;
     FListCopy: TSocketList;
-    FLock: TCriticalSection;
+    // FLock converted to TMonitor.Enter(Self)
     FLockCount: Integer;
   protected
     procedure Add(const Item: TncLine); inline;
@@ -192,12 +207,12 @@ type
   TncOnConnectDisconnect = procedure(Sender: TObject; aLine: TncLine) of object;
   TncOnReadData = procedure(Sender: TObject; aLine: TncLine; const aBuf: TBytes; aBufCount: Integer) of object;
   TncOnReconnected = procedure(Sender: TObject; aLine: TncLine) of object;
-  TncOnCommandReceived = procedure(Sender: TObject; aLine: TncLine; 
+  TncOnCommandReceived = procedure(Sender: TObject; aLine: TncLine;
     aCmd: Integer; const aData: TBytes) of object; // Binary protocol event
 
   // Command Processing Thread for Thread Pool (from ncSources)
   THandleCommandWorkType = (htwtOnCommand);
-  
+
   THandleCommandThread = class(TncReadyThread)
   private
     FWorkType: THandleCommandWorkType;
@@ -207,7 +222,7 @@ type
     FData: TBytes;
     FOnCommand: TncOnCommandReceived;
     FEventsUseMainThread: Boolean;
-    
+
     procedure CallOnCommandEvent;
   protected
     procedure ProcessEvent; override;
@@ -234,13 +249,13 @@ type
     FOnDisconnected: TncOnConnectDisconnect;
     FOnReadData: TncOnReadData;
     FLine: TncLine;
-    
+
     // Thread Pool Properties (from ncSources)
     FCommandProcessorThreadPriority: TncThreadPriority;
     FCommandProcessorThreads: Integer;
     FCommandProcessorThreadsPerCPU: Integer;
     FCommandProcessorThreadsGrowUpto: Integer;
-    
+
     // TLS Properties
     FUseTLS: Boolean;
     FTlsProvider: TncTlsProvider;
@@ -250,7 +265,13 @@ type
     FCACertificatesFile: string;
     FIgnoreCertificateErrors: Boolean;
     FIsServer: Boolean;
-    
+
+    // Compression and Encryption Properties (same as ncSources)
+    FCompression: TZCompressionLevel;
+    FEncryption: TEncryptorType;
+    FEncryptionKey: AnsiString;
+    FEncryptOnHashedKey: Boolean;
+
     function GetReadBufferLen: Integer;
     procedure SetReadBufferLen(const Value: Integer);
     function GetActive: Boolean; virtual; abstract;
@@ -268,7 +289,7 @@ type
     procedure SetNoDelay(const Value: Boolean);
     function GetKeepAlive: Boolean;
     procedure SetKeepAlive(const Value: Boolean);
-    
+
     // TLS Property Methods
     function GetUseTLS: Boolean;
     procedure SetUseTLS(const Value: Boolean);
@@ -284,7 +305,17 @@ type
     procedure SetCACertificatesFile(const Value: string);
     function GetIgnoreCertificateErrors: Boolean;
     procedure SetIgnoreCertificateErrors(const Value: Boolean);
-    
+
+    // Compression and Encryption Property Methods (same as ncSources)
+    function GetCompression: TZCompressionLevel;
+    procedure SetCompression(const Value: TZCompressionLevel);
+    function GetEncryption: TEncryptorType;
+    procedure SetEncryption(const Value: TEncryptorType);
+    function GetEncryptionKey: AnsiString;
+    procedure SetEncryptionKey(const Value: AnsiString);
+    function GetEncryptOnHashedKey: Boolean;
+    procedure SetEncryptOnHashedKey(const Value: Boolean);
+
     // Thread Pool Property Methods (from ncSources)
     function GetCommandProcessorThreadPriority: TncThreadPriority;
     procedure SetCommandProcessorThreadPriority(const Value: TncThreadPriority);
@@ -294,18 +325,18 @@ type
     procedure SetCommandProcessorThreadsPerCPU(const Value: Integer);
     function GetCommandProcessorThreadsGrowUpto: Integer;
     procedure SetCommandProcessorThreadsGrowUpto(const Value: Integer);
-    
+
   private
     FUseReaderThread: Boolean;
     procedure DoActivate(aActivate: Boolean); virtual; abstract;
     procedure SetUseReaderThread(const Value: Boolean);
   protected
-    PropertyLock, ShutDownLock: TCriticalSection;
+    PropertyLock, ShutDownLock: TObject; // TMonitor synchronization objects
     ReadBuf: TBytes;
-    
+
     // Thread Pool Infrastructure (from ncSources)
     HandleCommandThreadPool: TncThreadPool;
-    
+
     procedure Loaded; override;
     function CreateLineObject: TncLine; virtual;
     function GetHost: string; virtual; // Virtual method for TLS
@@ -335,13 +366,13 @@ type
     property OnDisconnected: TncOnConnectDisconnect read FOnDisconnected write FOnDisconnected;
     property OnReadData: TncOnReadData read FOnReadData write FOnReadData;
     property ReadBufferLen: Integer read GetReadBufferLen write SetReadBufferLen default DefReadBufferLen;
-    
+
     // Thread Pool Properties (from ncSources)
     property CommandProcessorThreadPriority: TncThreadPriority read GetCommandProcessorThreadPriority write SetCommandProcessorThreadPriority default DefCommandProcessorThreadPriority;
     property CommandProcessorThreads: Integer read GetCommandProcessorThreads write SetCommandProcessorThreads default DefCommandProcessorThreads;
     property CommandProcessorThreadsPerCPU: Integer read GetCommandProcessorThreadsPerCPU write SetCommandProcessorThreadsPerCPU default DefCommandProcessorThreadsPerCPU;
     property CommandProcessorThreadsGrowUpto: Integer read GetCommandProcessorThreadsGrowUpto write SetCommandProcessorThreadsGrowUpto default DefCommandProcessorThreadsGrowUpto;
-    
+
     // TLS Properties
     property UseTLS: Boolean read GetUseTLS write SetUseTLS default DefUseTLS;
     property TlsProvider: TncTlsProvider read GetTlsProvider write SetTlsProvider default DefTlsProvider;
@@ -350,6 +381,12 @@ type
     property PrivateKeyPassword: string read GetPrivateKeyPassword write SetPrivateKeyPassword;
     property CACertificatesFile: string read GetCACertificatesFile write SetCACertificatesFile;
     property IgnoreCertificateErrors: Boolean read GetIgnoreCertificateErrors write SetIgnoreCertificateErrors default DefIgnoreCertificateErrors;
+
+    // Compression and Encryption Properties (same as ncSources)
+    property Compression: TZCompressionLevel read GetCompression write SetCompression default DefCompression;
+    property Encryption: TEncryptorType read GetEncryption write SetEncryption default DefEncryption;
+    property EncryptionKey: AnsiString read GetEncryptionKey write SetEncryptionKey;
+    property EncryptOnHashedKey: Boolean read GetEncryptOnHashedKey write SetEncryptOnHashedKey default DefEncryptOnHashedKey;
   published
   end;
 
@@ -402,7 +439,7 @@ type
     procedure SendCommand(aCmd: Integer; const aData: TBytes = nil); // Binary protocol method
     function Receive(aTimeout: Cardinal = 2000): TBytes; inline;
     function ReceiveRaw(var aBytes: TBytes): Integer; inline;
-    procedure InternalReadDataHandler(Sender: TObject; aLine: TncLine; 
+    procedure InternalReadDataHandler(Sender: TObject; aLine: TncLine;
       const aBuf: TBytes; aBufCount: Integer); // Protocol detection handler
     property Host: string read GetHost write SetHost;
     property Reconnect: Boolean read GetReconnect write SetReconnect default True;
@@ -432,13 +469,13 @@ type
     property OnReadData;
     property OnReconnected;
     property OnCommand;
-    
+
     // Thread Pool Properties (from ncSources)
     property CommandProcessorThreadPriority;
     property CommandProcessorThreads;
     property CommandProcessorThreadsPerCPU;
     property CommandProcessorThreadsGrowUpto;
-    
+
     // TLS Properties
     property UseTLS;
     property TlsProvider;
@@ -447,6 +484,12 @@ type
     property PrivateKeyPassword;
     property CACertificatesFile;
     property IgnoreCertificateErrors;
+
+    // Compression and Encryption Properties
+    property Compression;
+    property Encryption;
+    property EncryptionKey;
+    property EncryptOnHashedKey;
   end;
 
   TncClientProcessor = class(TncReadyThread)
@@ -490,7 +533,7 @@ type
     function Receive(aLine: TncLine; aTimeout: Cardinal = 2000): TBytes; inline;
     function ReceiveRaw(aLine: TncLine; var aBytes: TBytes): Integer; inline;
     procedure SendCommand(aLine: TncLine; aCmd: Integer; const aData: TBytes = nil); // Binary protocol method
-    procedure InternalReadDataHandler(Sender: TObject; aLine: TncLine; 
+    procedure InternalReadDataHandler(Sender: TObject; aLine: TncLine;
       const aBuf: TBytes; aBufCount: Integer); // Protocol detection handler
     property OnCommand: TncOnCommandReceived read FOnCommand write FOnCommand;
     // Override OnReadData to preserve protocol detection
@@ -513,13 +556,13 @@ type
     property OnDisconnected;
     property OnReadData;
     property OnCommand;
-    
+
     // Thread Pool Properties (from ncSources)
     property CommandProcessorThreadPriority;
     property CommandProcessorThreads;
     property CommandProcessorThreadsPerCPU;
     property CommandProcessorThreadsGrowUpto;
-    
+
     // TLS Properties
     property UseTLS;
     property TlsProvider;
@@ -528,6 +571,12 @@ type
     property PrivateKeyPassword;
     property CACertificatesFile;
     property IgnoreCertificateErrors;
+
+    // Compression and Encryption Properties
+    property Compression;
+    property Encryption;
+    property EncryptionKey;
+    property EncryptOnHashedKey;
   end;
 
   TncServerProcessor = class(TncReadyThread)
@@ -564,7 +613,6 @@ end;
 constructor TThreadLineList.Create;
 begin
   inherited Create;
-  FLock := TCriticalSection.Create;
   FList := TSocketList.Create;
   FLockCount := 0;
 end;
@@ -577,7 +625,6 @@ begin
     inherited Destroy;
   finally
     UnlockListNoCopy;
-    FLock.Free;
   end;
 end;
 
@@ -615,18 +662,18 @@ end;
 
 function TThreadLineList.LockListNoCopy: TSocketList;
 begin
-  FLock.Acquire;
+  TMonitor.Enter(Self);
   Result := FList;
 end;
 
 procedure TThreadLineList.UnlockListNoCopy;
 begin
-  FLock.Release;
+  TMonitor.Exit(Self);
 end;
 
 function TThreadLineList.LockList: TSocketList;
 begin
-  FLock.Acquire;
+  TMonitor.Enter(Self);
   try
     if FLockCount = 0 then
     begin
@@ -637,13 +684,13 @@ begin
 
     FLockCount := FLockCount + 1;
   finally
-    FLock.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
 procedure TThreadLineList.UnlockList;
 begin
-  FLock.Acquire;
+  TMonitor.Enter(Self);
   try
     if FLockCount = 0 then
       raise Exception.Create('Cannot unlock a non-locked list');
@@ -653,7 +700,7 @@ begin
     if FLockCount = 0 then
       FListCopy.Free;
   finally
-    FLock.Release;
+    TMonitor.Exit(Self);
   end;
 end;
 
@@ -666,6 +713,10 @@ constructor TncTlsConnectionContext.Create(aIsServer: Boolean);
 begin
   inherited Create;
   FIsServer := aIsServer;
+
+  // CRITICAL FIX: Create lock for thread-safe TLS operations
+  // SChannel is NOT thread-safe for concurrent encrypt/decrypt on the same context
+  FLock := TObject.Create;
 
   // Initialize TLS contexts using FillChar and then set public fields
   FillChar(FClientContext, SizeOf(FClientContext), 0);
@@ -689,7 +740,20 @@ begin
     Assert(not FClientContext.Initialized, 'Client TLS context not cleaned up!');
   {$ENDIF}
 
+  // Free the lock object
+  FLock.Free;
+
   inherited Destroy;
+end;
+
+procedure TncTlsConnectionContext.Lock;
+begin
+  TMonitor.Enter(FLock);
+end;
+
+procedure TncTlsConnectionContext.Unlock;
+begin
+  TMonitor.Exit(FLock);
 end;
 
 function TncTlsConnectionContext.GetClientContext: PSChannelClient;
@@ -711,8 +775,8 @@ constructor TncTCPBaseDual.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
-  PropertyLock := TCriticalSection.Create;
-  ShutDownLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
+  ShutDownLock := TObject.Create;
 
   FInitActive := False;
   FFamily := DefFamily;
@@ -740,7 +804,13 @@ begin
   FPrivateKeyPassword := '';
   FCACertificatesFile := '';
   FIgnoreCertificateErrors := DefIgnoreCertificateErrors;
-  
+
+  // Initialize Compression and Encryption properties (same as ncSources)
+  FCompression := DefCompression;
+  FEncryption := DefEncryption;
+  FEncryptionKey := DefEncryptionKey;
+  FEncryptOnHashedKey := DefEncryptOnHashedKey;
+
   FIsServer := False;
 
   SetLength(ReadBuf, DefReadBufferLen);
@@ -786,7 +856,7 @@ begin
   Result := TncLineInternal.Create;
   TncLineInternal(Result).SetKind(Kind);
   TncLineInternal(Result).SetFamily(FFamily);
-  
+
   // Set up TLS callbacks if TLS is enabled
   if FUseTLS then
   begin
@@ -797,24 +867,24 @@ end;
 
 procedure TncTCPBaseDual.SetActive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     if not(csLoading in ComponentState) then
       DoActivate(Value);
 
     FInitActive := GetActive; // we only care here for the loaded event
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetFamily: TAddressType;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FFamily;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -826,7 +896,7 @@ begin
       raise EPropertySetError.Create(ECannotSetFamilyWhileConnectionIsActiveStr);
   end;
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Update base class family
     FFamily := Value;
@@ -837,17 +907,17 @@ begin
       TncLineInternal(FLine).SetFamily(Value);
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetPort: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPort;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -857,27 +927,27 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetPortWhileConnectionIsActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPort := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetReaderThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := ToNcThreadPriority(LineProcessor.Priority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetReaderThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     try
       LineProcessor.Priority := FromNcThreadPriority(Value);
@@ -885,27 +955,27 @@ begin
       // Some android devices cannot handle changing priority
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetEventsUseMainThread: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FEventsUseMainThread;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetEventsUseMainThread(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FEventsUseMainThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -915,85 +985,85 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetUseReaderThreadWhileActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseReaderThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetNoDelay: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FNoDelay;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetNoDelay(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FNoDelay := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetKeepAlive: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FKeepAlive;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetKeepAlive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FKeepAlive := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 // Update
 function TncTCPBaseDual.GetReadBufferLen: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReadBufferLen;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 // Update
 procedure TncTCPBaseDual.SetReadBufferLen(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReadBufferLen := Value;
     SetLength(ReadBuf, FReadBufferLen);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 // TLS Property Methods
 function TncTCPBaseDual.GetUseTLS: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FUseTLS;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1003,10 +1073,10 @@ begin
     if Active then
       raise EPropertySetError.Create('Cannot set UseTLS property whilst the connection is active');
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseTLS := Value;
-    
+
     // Add TLS callback assignment when TLS is enabled
     if Value then
     begin
@@ -1030,17 +1100,17 @@ begin
       end;
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetTlsProvider: TncTlsProvider;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FTlsProvider;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1050,7 +1120,7 @@ begin
     if Active then
       raise EPropertySetError.Create('Cannot set TlsProvider property whilst the connection is active');
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Validate provider availability
     case Value of
@@ -1066,110 +1136,192 @@ begin
           raise EOpenSSLNotAvailable.Create(EOpenSSLNotAvailableStr);
         end;
     end;
-    
+
     FTlsProvider := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetCertificateFile: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCertificateFile;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetCertificateFile(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCertificateFile := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetPrivateKeyFile: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPrivateKeyFile;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetPrivateKeyFile(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPrivateKeyFile := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetPrivateKeyPassword: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPrivateKeyPassword;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetPrivateKeyPassword(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPrivateKeyPassword := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetCACertificatesFile: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCACertificatesFile;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetCACertificatesFile(const Value: string);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCACertificatesFile := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetIgnoreCertificateErrors: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FIgnoreCertificateErrors;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetIgnoreCertificateErrors(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FIgnoreCertificateErrors := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+// Compression and Encryption Property Implementations (same as ncSources)
+
+function TncTCPBaseDual.GetCompression: TZCompressionLevel;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FCompression;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetCompression(const Value: TZCompressionLevel);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FCompression := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+function TncTCPBaseDual.GetEncryption: TEncryptorType;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FEncryption;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetEncryption(const Value: TEncryptorType);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FEncryption := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+function TncTCPBaseDual.GetEncryptionKey: AnsiString;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FEncryptionKey;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetEncryptionKey(const Value: AnsiString);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FEncryptionKey := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+function TncTCPBaseDual.GetEncryptOnHashedKey: Boolean;
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    Result := FEncryptOnHashedKey;
+  finally
+    TMonitor.Exit(PropertyLock);
+  end;
+end;
+
+procedure TncTCPBaseDual.SetEncryptOnHashedKey(const Value: Boolean);
+begin
+  TMonitor.Enter(PropertyLock);
+  try
+    FEncryptOnHashedKey := Value;
+  finally
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1180,18 +1332,18 @@ begin
   Result := ''; // Default implementation, override in client
 end;
 
-// TLS Functionality Methods
 {$IFDEF MSWINDOWS}
+// TLS Functionality Methods
 procedure TncTCPBaseDual.InitializeTLS(aLine: TncLine);
 var
   TlsContext: TncTlsConnectionContext;
 begin
   if not FUseTLS then
     Exit;
-  
+
   if aLine = nil then
     Exit;
-  
+
   // Get or create per-connection TLS context
   if TncLineInternal(aLine).DataObject = nil then
   begin
@@ -1202,7 +1354,7 @@ begin
   begin
     TlsContext := TncTlsConnectionContext(TncLineInternal(aLine).DataObject);
   end;
-  
+
   // Check if TLS is already initialized for this specific connection
   if FIsServer then
   begin
@@ -1214,7 +1366,7 @@ begin
     if TlsContext.GetClientContext^.Initialized then
       Exit;
   end;
-  
+
   // Initialize TLS for this specific connection
   if FIsServer then
   begin
@@ -1226,8 +1378,10 @@ begin
   end;
 end;
 {$ELSE}
+// TLS Functionality Methods - Linux stub
 procedure TncTCPBaseDual.InitializeTLS(aLine: TncLine);
 begin
+  // TLS not supported on Linux yet
   if FUseTLS then
     raise ETlsProviderNotSupported.Create(ETlsProviderNotSupportedStr);
 end;
@@ -1266,7 +1420,7 @@ begin
   begin
     try
       TlsContext := TncTlsConnectionContext(TncLineInternal(aLine).DataObject);
-      
+
       case FTlsProvider of
         tpSChannel:
           begin
@@ -1286,7 +1440,7 @@ begin
             // Future OpenSSL cleanup
           end;
       end;
-      
+
       // Clean up the TLS context object
       TncLineInternal(aLine).DataObject := nil;
       TlsContext.Free;
@@ -1299,7 +1453,7 @@ end;
 {$ELSE}
 procedure TncTCPBaseDual.FinalizeTLS(aLine: TncLine);
 begin
-  // No TLS cleanup needed on non-Windows platforms
+  // TLS not supported on Linux yet - no cleanup needed
 end;
 {$ENDIF}
 
@@ -1311,23 +1465,30 @@ begin
   if FUseTLS and (TncLineInternal(aLine).DataObject <> nil) then
   begin
     TlsContext := TncTlsConnectionContext(TncLineInternal(aLine).DataObject);
-    
+
     case FTlsProvider of
       tpSChannel:
         begin
-          if FIsServer then
-          begin
-            if TlsContext.GetServerContext^.Initialized then
-              Result := TlsContext.GetServerContext^.Send(aLine, @aBuf, aBufSize)
+          // CRITICAL FIX: Lock the TLS context during Send
+          // SChannel is NOT thread-safe for concurrent encrypt/decrypt
+          TlsContext.Lock;
+          try
+            if FIsServer then
+            begin
+              if TlsContext.GetServerContext^.Initialized then
+                Result := TlsContext.GetServerContext^.Send(aLine, @aBuf, aBufSize)
+              else
+                Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
+            end
             else
-              Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
-          end
-          else
-          begin
-            if TlsContext.GetClientContext^.Initialized then
-              Result := TlsContext.GetClientContext^.Send(aLine, @aBuf, aBufSize)
-            else
-              Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
+            begin
+              if TlsContext.GetClientContext^.Initialized then
+                Result := TlsContext.GetClientContext^.Send(aLine, @aBuf, aBufSize)
+              else
+                Result := TncLineInternal(aLine).SendBuffer(aBuf, aBufSize);
+            end;
+          finally
+            TlsContext.Unlock;
           end;
         end;
       tpOpenSSL:
@@ -1355,11 +1516,13 @@ function TncTCPBaseDual.ReceiveTLS(aLine: TncLine; var aBuf; aBufSize: Integer):
 var
   TlsContext: TncTlsConnectionContext;
   WasHandshakeCompleted: Boolean;
+  HandshakeJustCompleted: Boolean;
+  SessionClosed: Boolean;
 begin
   if FUseTLS and (TncLineInternal(aLine).DataObject <> nil) then
   begin
     TlsContext := TncTlsConnectionContext(TncLineInternal(aLine).DataObject);
-    
+
     case FTlsProvider of
       tpSChannel:
         begin
@@ -1367,22 +1530,32 @@ begin
           begin
             if TlsContext.GetServerContext^.Initialized then
             begin
-              WasHandshakeCompleted := TlsContext.GetServerContext^.HandshakeCompleted;
-              
-              Result := TlsContext.GetServerContext^.Receive(aLine, @aBuf, aBufSize);
-              
-              // CRITICAL FIX: Detect TLS disconnection when Receive returns 0 after handshake completion
-              if (Result = 0) and WasHandshakeCompleted then
-              begin
-                raise Exception.Create('TLS client disconnected');
+              // CRITICAL FIX: Lock the TLS context during Receive
+              // SChannel is NOT thread-safe for concurrent encrypt/decrypt
+              TlsContext.Lock;
+              try
+                WasHandshakeCompleted := TlsContext.GetServerContext^.HandshakeCompleted;
+
+                Result := TlsContext.GetServerContext^.Receive(aLine, @aBuf, aBufSize);
+
+                // Capture state while still locked
+                SessionClosed := TlsContext.GetServerContext^.SessionClosed;
+                HandshakeJustCompleted := not WasHandshakeCompleted and TlsContext.GetServerContext^.HandshakeCompleted;
+              finally
+                TlsContext.Unlock;
               end;
-              
+
+              // CRITICAL FIX: Detect TLS disconnection when Receive returns 0 after handshake completion
+              // BUT only if SessionClosed is also true (indicating actual disconnection)
+              if (Result = 0) and WasHandshakeCompleted and SessionClosed then
+                raise Exception.Create('TLS client disconnected');
+
               // Check if handshake just completed
-              if not WasHandshakeCompleted and TlsContext.GetServerContext^.HandshakeCompleted then
+              if HandshakeJustCompleted then
               begin
                 // Handshake just completed, call OnConnected
                 HandleTLSHandshakeComplete(aLine);
-                
+
                 // CRITICAL FIX: Return -1 to prevent OnReadData from being triggered with empty data
                 // The handshake completion callback has already been called above
                 Result := -1;
@@ -1399,15 +1572,22 @@ begin
               // But we need to track when it JUST became initialized (not if it was already initialized)
               // Since the client calls AfterConnection during OnBeforeConnected, we know that
               // the first call to Receive after OnBeforeConnected is when handshake is complete
-              
-              Result := TlsContext.GetClientContext^.Receive(aLine, @aBuf, aBufSize);
-              
-              // CRITICAL FIX: Detect TLS disconnection when Receive returns 0 after handshake completion
-              if (Result = 0) and TlsContext.GetClientContext^.Initialized then
-              begin
-                raise Exception.Create('TLS server disconnected');
+
+              // CRITICAL FIX: Lock the TLS context during Receive
+              // SChannel is NOT thread-safe for concurrent encrypt/decrypt
+              TlsContext.Lock;
+              try
+                Result := TlsContext.GetClientContext^.Receive(aLine, @aBuf, aBufSize);
+                SessionClosed := TlsContext.GetClientContext^.SessionClosed;
+              finally
+                TlsContext.Unlock;
               end;
-              
+
+              // CRITICAL FIX: Detect TLS disconnection when Receive returns 0 after handshake completion
+              // BUT only if SessionClosed is also true (indicating actual disconnection)
+              if (Result = 0) and TlsContext.GetClientContext^.Initialized and SessionClosed then
+                raise Exception.Create('TLS server disconnected');
+
               // Client-side handshake completion detection:
               // The client TLS handshake is handled in OnBeforeConnected event
               // So by the time we get here, handshake is already complete
@@ -1467,11 +1647,12 @@ begin
 
   TncLineInternal(Line).OnConnected := DataSocketConnected;
   TncLineInternal(Line).OnDisconnected := DataSocketDisconnected;
-  
+
   // Set up TLS callbacks if TLS is enabled
   if FUseTLS then
   begin
     TncLineInternal(Line).OnBeforeConnected := HandleTLSHandshake;
+    // REMOVED: OnBeforeDisconnected - now using direct FinalizeTLS call like ncSockets.pas
   end;
 
   LineProcessor := TncClientProcessor.Create(Self);
@@ -1553,7 +1734,7 @@ begin
     end;
 
   // TLS initialization is now handled by OnBeforeConnected event
-  
+
   if Assigned(OnConnected) then
     try
       OnConnected(Self, aLine);
@@ -1569,6 +1750,7 @@ end;
 
 procedure TncCustomTCPClientDual.DataSocketDisconnected(aLine: TncLine);
 begin
+  // FIXED: Use same pattern as ncSockets.pas - direct TLS cleanup call
   if UseTLS then
     FinalizeTLS(aLine);
 
@@ -1578,6 +1760,7 @@ begin
     except
     end;
 end;
+
 
 procedure TncCustomTCPClientDual.Send(const aBuf; aBufSize: Integer);
 begin
@@ -1606,7 +1789,7 @@ var
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
-  
+
   // Create command like ncSources does
   Command.CommandType := ctInitiator;
   Command.UniqueID := 0; // Simplified for now
@@ -1617,24 +1800,34 @@ begin
   Command.ResultIsErrorString := False;
   Command.SourceComponentHandler := '';
   Command.PeerComponentHandler := '';
-  
+
   // Convert to bytes like ncSources
   MessageBytes := Command.ToBytes;
+
+  // Apply compression and encryption (same order as ncSources)
+  // Step 1: Encrypt first (if enabled)
+  if Encryption <> etNoEncryption then
+    MessageBytes := EncryptBytes(MessageBytes, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+
+  // Step 2: Compress second (if enabled)
+  if Compression <> zcNone then
+    MessageBytes := CompressBytes(MessageBytes, Compression);
+
   MsgByteCount := Length(MessageBytes);
-  
+
   // Use ncSources protocol format: [Magic: 4][MessageLength: 8][Data: variable]
   HeaderBytes := SizeOf(TMagicHeaderType) + SizeOf(MsgByteCount);
   SetLength(FinalBuf, HeaderBytes + MsgByteCount);
-  
+
   // Write protocol header (same as ncSources)
   PMagicHeaderType(@FinalBuf[0])^ := MagicHeader;                    // Magic: 4 bytes
   PUInt64(@FinalBuf[SizeOf(MagicHeader)])^ := MsgByteCount;         // MessageLength: 8 bytes
   Move(MessageBytes[0], FinalBuf[HeaderBytes], MsgByteCount);       // Data: variable
-  
+
   Send(FinalBuf);
 end;
 
-procedure TncCustomTCPClientDual.InternalReadDataHandler(Sender: TObject; aLine: TncLine; 
+procedure TncCustomTCPClientDual.InternalReadDataHandler(Sender: TObject; aLine: TncLine;
   const aBuf: TBytes; aBufCount: Integer);
 var
   Command: TncCommand;
@@ -1665,9 +1858,9 @@ begin
     // If we reach here, TLS handshake is complete and data is decrypted application data
     // Continue with normal protocol detection below
   end;
-  
+
   Ofs := 0;
-  
+
   // Process incoming data using ncSources-style state machine
   while Ofs < aBufCount do
   begin
@@ -1676,16 +1869,16 @@ begin
     begin
       // ncSources approach: We know exactly how many bytes we need
       BytesToRead := Min(FConnectionState.BytesToEndOfMessage, aBufCount - Ofs);
-      
+
       // Accumulate data efficiently
       OldLen := Length(FConnectionState.MessageBuffer);
       SetLength(FConnectionState.MessageBuffer, OldLen + BytesToRead);
       Move(aBuf[Ofs], FConnectionState.MessageBuffer[OldLen], BytesToRead);
-      
+
       Ofs := Ofs + BytesToRead;
       FConnectionState.BytesToEndOfMessage := FConnectionState.BytesToEndOfMessage - BytesToRead;
     end;
-    
+
     // Do we have a complete message?
     if FConnectionState.BytesToEndOfMessage = 0 then
     begin
@@ -1697,10 +1890,22 @@ begin
             begin
               // Process binary command - Route to Thread Pool (from ncSources)
               try
-                Command.FromBytes(FConnectionState.MessageBuffer);
-                
+                // Apply decompression and decryption (reverse order of sending)
+                var ProcessedData := FConnectionState.MessageBuffer;
+
+                // Step 1: Decompress first (reverse order)
+                if Compression <> zcNone then
+                  ProcessedData := DecompressBytes(ProcessedData);
+
+                // Step 2: Decrypt second
+                if Encryption <> etNoEncryption then
+                  ProcessedData := DecryptBytes(ProcessedData, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+
+                // Parse the processed data
+                Command.FromBytes(ProcessedData);
+
                 // Route to thread pool for processing like ncSources
-                HandleCommandThreadPool.Serialiser.Acquire;
+                TMonitor.Enter(HandleCommandThreadPool);
                 try
                   var HandleCommandThread := THandleCommandThread(HandleCommandThreadPool.RequestReadyThread);
                   HandleCommandThread.WorkType := htwtOnCommand;
@@ -1712,10 +1917,10 @@ begin
                   HandleCommandThread.EventsUseMainThread := EventsUseMainThread;
                   HandleCommandThreadPool.RunRequestedThread(HandleCommandThread);
                 finally
-                  HandleCommandThreadPool.Serialiser.Release;
+                  TMonitor.Exit(HandleCommandThreadPool);
                 end;
               except
-                // If parsing fails, treat as text
+                // If decompression/decryption/parsing fails, treat as text
                 if Assigned(OriginalOnReadData) then
                   OriginalOnReadData(Self, aLine, FConnectionState.MessageBuffer, Length(FConnectionState.MessageBuffer));
               end;
@@ -1727,11 +1932,11 @@ begin
                 OriginalOnReadData(Self, aLine, FConnectionState.MessageBuffer, Length(FConnectionState.MessageBuffer));
             end;
         end;
-        
+
         // Reset for next message
         FConnectionState.Reset;
       end;
-      
+
       // Start new message detection if we have more data
       if Ofs < aBufCount then
       begin
@@ -1742,7 +1947,7 @@ begin
           begin
             // Binary protocol detected
             FConnectionState.MessageType := mtBinary;
-            
+
             // Do we have the complete header?
             if (aBufCount - Ofs) >= (SizeOf(TMagicHeaderType) + SizeOf(UInt64)) then
             begin
@@ -1750,10 +1955,10 @@ begin
               FConnectionState.ExpectedMessageLength := PUInt64(@aBuf[Ofs + SizeOf(TMagicHeaderType)])^;
               FConnectionState.BytesToEndOfMessage := FConnectionState.ExpectedMessageLength;
               FConnectionState.HeaderComplete := True;
-              
+
               // Skip past header
               Ofs := Ofs + SizeOf(TMagicHeaderType) + SizeOf(UInt64);
-              
+
               // Continue to accumulate message data
               Continue;
             end
@@ -1826,11 +2031,11 @@ end;
 
 function TncCustomTCPClientDual.GetHost: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FHost;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1840,51 +2045,51 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetHostWhileConnectionIsActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FHost := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncCustomTCPClientDual.GetReconnect: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReconnect;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncCustomTCPClientDual.SetReconnect(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReconnect := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncCustomTCPClientDual.GetReconnectInterval: Cardinal;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReconnectInterval;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncCustomTCPClientDual.SetReconnectInterval(const Value: Cardinal);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReconnectInterval := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1958,7 +2163,7 @@ begin
             FClientSocket.LastConnectAttempt := TStopWatch.GetTimeStamp;
 
             WasReconnected := False;
-            FClientSocket.PropertyLock.Acquire;
+            TMonitor.Enter(FClientSocket.PropertyLock);
             try
               if not FClientSocket.Active then
               begin
@@ -1973,7 +2178,7 @@ begin
                 end;
               end;
             finally
-              FClientSocket.PropertyLock.Release;
+              TMonitor.Exit(FClientSocket.PropertyLock);
             end;
             if WasReconnected then
               if FClientSocket.EventsUseMainThread then
@@ -1997,7 +2202,7 @@ end;
 constructor TncCustomTCPServerDual.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
-  
+
   FIsServer := True; // Set server flag for TLS context selection
   FOnCommand := nil; // Initialize the new field
   OriginalOnReadData := OnReadData; // Store original handler
@@ -2012,11 +2217,12 @@ begin
 
   TncLineInternal(Listener).OnConnected := DataSocketConnected;
   TncLineInternal(Listener).OnDisconnected := DataSocketDisconnected;
-  
+
   // Set up TLS callbacks if TLS is enabled
   if FUseTLS then
   begin
     TncLineInternal(Listener).OnBeforeConnected := HandleTLSHandshake;
+    // REMOVED: OnBeforeDisconnected - now using direct FinalizeTLS call like ncSockets.pas
   end;
   Lines := TThreadLineList.Create();
 
@@ -2076,7 +2282,6 @@ begin
       TncLineInternal(Listener).DestroyHandle;
 
     // Cleanup connected sockets
-{$HINTS OFF}
     DataSockets := Lines.LockListNoCopy;
     try
       for i := 0 to DataSockets.Count - 1 do
@@ -2102,7 +2307,7 @@ var
 begin
   if UseReaderThread then
   begin
-    ShutDownLock.Acquire;
+    TMonitor.Enter(ShutDownLock);
     try
       for i := 0 to High(LinesToShutDown) do
         if LinesToShutDown[i] = aLine then
@@ -2111,7 +2316,7 @@ begin
       SetLength(LinesToShutDown, Length(LinesToShutDown) + 1);
       LinesToShutDown[High(LinesToShutDown)] := aLine;
     finally
-      ShutDownLock.Release;
+      TMonitor.Exit(ShutDownLock);
     end;
   end
   else
@@ -2157,7 +2362,7 @@ begin
     end;
 
     // TLS initialization is now handled by OnBeforeConnected event
-    
+
     // For TLS connections, delay OnConnected until after handshake completes
     if not UseTLS then
     begin
@@ -2185,6 +2390,7 @@ begin
     SetLength(ReadSocketHandles, 0)
   else
   begin
+    // FIXED: Use same pattern as ncSockets.pas - direct TLS cleanup call
     if UseTLS then
       FinalizeTLS(aLine);
 
@@ -2192,7 +2398,7 @@ begin
     FConnectionStates.Remove(aLine);
 
     // First remove the handle to prevent further processing
-    PropertyLock.Acquire;
+    TMonitor.Enter(PropertyLock);
     try
       for i := 0 to High(ReadSocketHandles) do
         if ReadSocketHandles[i] = aLine.Handle then
@@ -2202,7 +2408,7 @@ begin
           Break;
         end;
     finally
-      PropertyLock.Release;
+      TMonitor.Exit(PropertyLock);
     end;
 
     // Then handle disconnect event
@@ -2292,7 +2498,7 @@ var
 begin
   if not Active then
     raise EPropertySetError.Create(ECannotSendWhileSocketInactiveStr);
-  
+
   // Create command like ncSources does
   Command.CommandType := ctInitiator;
   Command.UniqueID := 0; // Simplified for now
@@ -2303,24 +2509,34 @@ begin
   Command.ResultIsErrorString := False;
   Command.SourceComponentHandler := '';
   Command.PeerComponentHandler := '';
-  
+
   // Convert to bytes like ncSources
   MessageBytes := Command.ToBytes;
+
+  // Apply compression and encryption (same order as ncSources)
+  // Step 1: Encrypt first (if enabled)
+  if Encryption <> etNoEncryption then
+    MessageBytes := EncryptBytes(MessageBytes, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+
+  // Step 2: Compress second (if enabled)
+  if Compression <> zcNone then
+    MessageBytes := CompressBytes(MessageBytes, Compression);
+
   MsgByteCount := Length(MessageBytes);
-  
+
   // Use ncSources protocol format: [Magic: 4][MessageLength: 8][Data: variable]
   HeaderBytes := SizeOf(TMagicHeaderType) + SizeOf(MsgByteCount);
   SetLength(FinalBuf, HeaderBytes + MsgByteCount);
-  
+
   // Write protocol header (same as ncSources)
   PMagicHeaderType(@FinalBuf[0])^ := MagicHeader;                    // Magic: 4 bytes
   PUInt64(@FinalBuf[SizeOf(MagicHeader)])^ := MsgByteCount;         // MessageLength: 8 bytes
   Move(MessageBytes[0], FinalBuf[HeaderBytes], MsgByteCount);       // Data: variable
-  
+
   Send(aLine, FinalBuf);
 end;
 
-procedure TncCustomTCPServerDual.InternalReadDataHandler(Sender: TObject; aLine: TncLine; 
+procedure TncCustomTCPServerDual.InternalReadDataHandler(Sender: TObject; aLine: TncLine;
   const aBuf: TBytes; aBufCount: Integer);
 var
   Command: TncCommand;
@@ -2352,16 +2568,16 @@ begin
     // If we reach here, TLS handshake is complete and data is decrypted application data
     // Continue with normal protocol detection below
   end;
-  
+
   // Get or create connection state
   if not FConnectionStates.TryGetValue(aLine, ConnectionState) then
   begin
     ConnectionState.Reset;
     FConnectionStates.Add(aLine, ConnectionState);
   end;
-  
+
   Ofs := 0;
-  
+
   // Process incoming data using ncSources-style state machine
   while Ofs < aBufCount do
   begin
@@ -2370,16 +2586,16 @@ begin
     begin
       // ncSources approach: We know exactly how many bytes we need
       BytesToRead := Min(ConnectionState.BytesToEndOfMessage, aBufCount - Ofs);
-      
+
       // Accumulate data efficiently
       OldLen := Length(ConnectionState.MessageBuffer);
       SetLength(ConnectionState.MessageBuffer, OldLen + BytesToRead);
       Move(aBuf[Ofs], ConnectionState.MessageBuffer[OldLen], BytesToRead);
-      
+
       Ofs := Ofs + BytesToRead;
       ConnectionState.BytesToEndOfMessage := ConnectionState.BytesToEndOfMessage - BytesToRead;
     end;
-    
+
     // Do we have a complete message?
     if ConnectionState.BytesToEndOfMessage = 0 then
     begin
@@ -2391,10 +2607,22 @@ begin
             begin
               // Process binary command - Route to Thread Pool (from ncSources)
               try
-                Command.FromBytes(ConnectionState.MessageBuffer);
-                
+                // Apply decompression and decryption (reverse order of sending)
+                var ProcessedData := ConnectionState.MessageBuffer;
+
+                // Step 1: Decompress first (reverse order)
+                if Compression <> zcNone then
+                  ProcessedData := DecompressBytes(ProcessedData);
+
+                // Step 2: Decrypt second
+                if Encryption <> etNoEncryption then
+                  ProcessedData := DecryptBytes(ProcessedData, EncryptionKey, Encryption, EncryptOnHashedKey, False);
+
+                // Parse the processed data
+                Command.FromBytes(ProcessedData);
+
                 // Route to thread pool for processing like ncSources
-                HandleCommandThreadPool.Serialiser.Acquire;
+                TMonitor.Enter(HandleCommandThreadPool);
                 try
                   var HandleCommandThread := THandleCommandThread(HandleCommandThreadPool.RequestReadyThread);
                   HandleCommandThread.WorkType := htwtOnCommand;
@@ -2406,10 +2634,10 @@ begin
                   HandleCommandThread.EventsUseMainThread := EventsUseMainThread;
                   HandleCommandThreadPool.RunRequestedThread(HandleCommandThread);
                 finally
-                  HandleCommandThreadPool.Serialiser.Release;
+                  TMonitor.Exit(HandleCommandThreadPool);
                 end;
               except
-                // If parsing fails, treat as text
+                // If decompression/decryption/parsing fails, treat as text
                 if Assigned(OriginalOnReadData) then
                   OriginalOnReadData(Self, aLine, ConnectionState.MessageBuffer, Length(ConnectionState.MessageBuffer));
               end;
@@ -2421,11 +2649,11 @@ begin
                 OriginalOnReadData(Self, aLine, ConnectionState.MessageBuffer, Length(ConnectionState.MessageBuffer));
             end;
         end;
-        
+
         // Reset for next message
         ConnectionState.Reset;
       end;
-      
+
       // Start new message detection if we have more data
       if Ofs < aBufCount then
       begin
@@ -2436,7 +2664,7 @@ begin
           begin
             // Binary protocol detected
             ConnectionState.MessageType := mtBinary;
-            
+
             // Do we have the complete header?
             if (aBufCount - Ofs) >= (SizeOf(TMagicHeaderType) + SizeOf(UInt64)) then
             begin
@@ -2444,10 +2672,10 @@ begin
               ConnectionState.ExpectedMessageLength := PUInt64(@aBuf[Ofs + SizeOf(TMagicHeaderType)])^;
               ConnectionState.BytesToEndOfMessage := ConnectionState.ExpectedMessageLength;
               ConnectionState.HeaderComplete := True;
-              
+
               // Skip past header
               Ofs := Ofs + SizeOf(TMagicHeaderType) + SizeOf(UInt64);
-              
+
               // Continue to accumulate message data
               Continue;
             end
@@ -2480,7 +2708,7 @@ begin
       end;
     end;
   end;
-  
+
   // Update connection state
   FConnectionStates.AddOrSetValue(aLine, ConnectionState);
 end;
@@ -2509,9 +2737,9 @@ var
 begin
   // The list may be locked from custom code executed in the OnReadData handler
   // So we will not delete anything, or lock the list, until this lock is freed
-  if FServerSocket.Lines.FLock.TryEnter then
+  if TMonitor.TryEnter(FServerSocket.Lines) then
     try
-      FServerSocket.ShutDownLock.Acquire;
+      TMonitor.Enter(FServerSocket.ShutDownLock);
       try
         for i := 0 to High(FServerSocket.LinesToShutDown) do
           try
@@ -2522,10 +2750,10 @@ begin
           end;
         SetLength(FServerSocket.LinesToShutDown, 0);
       finally
-        FServerSocket.ShutDownLock.Release;
+        TMonitor.Exit(FServerSocket.ShutDownLock);
       end;
     finally
-      FServerSocket.Lines.FLock.Leave;
+      TMonitor.Exit(FServerSocket.Lines);
     end;
 end;
 
@@ -2634,39 +2862,39 @@ end;
 // Thread Pool Property Implementations (from ncSources)
 function TncTCPBaseDual.GetCommandProcessorThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCommandProcessorThreadPriority;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetCommandProcessorThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCommandProcessorThreadPriority := Value;
     if not(csLoading in ComponentState) then
       HandleCommandThreadPool.SetThreadPriority(Value);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetCommandProcessorThreads: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCommandProcessorThreads;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetCommandProcessorThreads(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCommandProcessorThreads := Value;
     if Value <> 0 then
@@ -2676,23 +2904,23 @@ begin
       HandleCommandThreadPool.SetExecThreads(Max(1, Max(FCommandProcessorThreads, GetNumberOfProcessors * FCommandProcessorThreadsPerCPU)),
         FCommandProcessorThreadPriority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetCommandProcessorThreadsPerCPU: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCommandProcessorThreadsPerCPU;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetCommandProcessorThreadsPerCPU(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCommandProcessorThreadsPerCPU := Value;
     if Value <> 0 then
@@ -2702,29 +2930,29 @@ begin
       HandleCommandThreadPool.SetExecThreads(Max(1, Max(FCommandProcessorThreads, GetNumberOfProcessors * FCommandProcessorThreadsPerCPU)),
         FCommandProcessorThreadPriority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncTCPBaseDual.GetCommandProcessorThreadsGrowUpto: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FCommandProcessorThreadsGrowUpto;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncTCPBaseDual.SetCommandProcessorThreadsGrowUpto(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FCommandProcessorThreadsGrowUpto := Value;
     if not(csLoading in ComponentState) then
       HandleCommandThreadPool.GrowUpto := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -2750,5 +2978,6 @@ end;
 
 
 end.
+
 
 

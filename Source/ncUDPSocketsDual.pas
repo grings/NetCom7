@@ -6,6 +6,9 @@ unit ncUDPSocketsDual;
 // This unit implements UDP Server and UDP Client components with both
 // raw UDP support and lightweight command protocol support
 //
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // 23/07/2025
 // - Lightweight Command Protocol (LCP)
 // - Auto-chunking for large data
@@ -103,7 +106,7 @@ type
   TncChunkManager = class
   private
     FTransfers: TDictionary<UInt32, TChunkTransfer>; // Hash table for O(1) lookup
-    FLock: TCriticalSection;
+    FLock: TObject; // TMonitor synchronization object
     function GenerateTransferID: UInt32;
     procedure CleanupExpiredTransfers;
   public
@@ -165,7 +168,7 @@ type
     procedure DoActivate(aActivate: Boolean); virtual; abstract;
     procedure SetUseReaderThread(const Value: Boolean);
   protected
-    PropertyLock: TCriticalSection;
+    PropertyLock: TObject; // TMonitor synchronization object
     ReadBuf: TBytes;
     procedure Loaded; override;
     function CreateLineObject: TncLine; virtual;
@@ -314,7 +317,7 @@ constructor TncUDPBaseDual.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
 
-  PropertyLock := TCriticalSection.Create;
+  PropertyLock := TObject.Create;
 
   FInitActive := False;
   FFamily := DefFamily;
@@ -359,23 +362,23 @@ end;
 
 procedure TncUDPBaseDual.SetActive(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     if not(csLoading in ComponentState) then
       DoActivate(Value);
     FInitActive := GetActive;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseDual.GetFamily: TAddressType;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FFamily;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -388,7 +391,7 @@ begin
         (ECannotSetFamilyWhileConnectionIsActiveStr);
   end;
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     // Update base class family
     FFamily := Value;
@@ -399,17 +402,17 @@ begin
       TncLineInternal(FLine).SetFamily(Value);
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseDual.GetPort: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FPort;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -419,27 +422,27 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetPortWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FPort := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseDual.GetReaderThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := ToNcThreadPriority(LineProcessor.Priority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBaseDual.SetReaderThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     try
       LineProcessor.Priority := FromNcThreadPriority(Value);
@@ -447,27 +450,27 @@ begin
       // Some android devices cannot handle changing priority
     end;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseDual.GetBroadcast: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FBroadcast;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBaseDual.SetBroadcast(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FBroadcast := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -477,32 +480,32 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetUseReaderThreadWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FUseReaderThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncUDPBaseDual.GetReadBufferLen: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FReadBufferLen;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncUDPBaseDual.SetReadBufferLen(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FReadBufferLen := Value;
     SetLength(ReadBuf, FReadBufferLen);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -617,11 +620,11 @@ end;
 
 function TncCustomUDPClientDual.GetHost: string;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FHost;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -631,11 +634,11 @@ begin
     if Active then
       raise EPropertySetError.Create(ECannotSetHostWhileSocketActiveStr);
 
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FHost := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -1199,7 +1202,7 @@ end;
 constructor TncChunkManager.Create;
 begin
   inherited Create;
-  FLock := TCriticalSection.Create;
+  FLock := TObject.Create;
   FTransfers := TDictionary<UInt32, TChunkTransfer>.Create;
 end;
 
@@ -1248,7 +1251,7 @@ var
   MaxDataSize: Integer;
   BitArraySize: Integer;
 begin
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     CleanupExpiredTransfers;
 
@@ -1277,7 +1280,7 @@ begin
 
     Result := Transfer.TransferID;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1288,7 +1291,7 @@ var
   BitArraySize: Integer;
 begin
   Result := False;
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     // Check if transfer already exists
     if FTransfers.TryGetValue(ATransferID, Transfer) then
@@ -1323,7 +1326,7 @@ begin
 
     Result := True;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1341,7 +1344,7 @@ begin
   if DataSize = 0 then Exit;
 
   // Single lock operation only
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     if FTransfers.TryGetValue(ATransferID, Transfer) then
     begin
@@ -1377,7 +1380,7 @@ begin
       end;
     end;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 
@@ -1387,7 +1390,7 @@ var
   Transfer: TChunkTransfer;
 begin
   Result := False;
-  FLock.Enter;
+  TMonitor.Enter(FLock);
   try
     if FTransfers.TryGetValue(ATransferID, Transfer) and (Transfer.FragmentsRemaining = 0) then
     begin
@@ -1410,7 +1413,7 @@ begin
       Result := True;
     end;
   finally
-    FLock.Leave;
+    TMonitor.Exit(FLock);
   end;
 end;
 

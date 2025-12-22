@@ -28,6 +28,9 @@ unit ncSocketsThd;
 // Architecture:
 // Network Data -> Reader Thread -> Processing Thread Pool -> OnReadData Event
 //
+// 25/07/2025- by J.Pauwels
+// - Replace TCriticalSection to TMonitor
+//
 // 13/07/2025 - by J.Pauwels
 // - Added TLS/SSL support through SChannel integration
 // - Added TLS properties (UseTLS, TlsProvider, CertificateFile)
@@ -62,17 +65,17 @@ uses
 type
   // Event type for raw data processing
   TncOnServerReadData = procedure(
-    Sender: TObject; 
-    aLine: TncLine; 
-    const aBuf: TBytes; 
+    Sender: TObject;
+    aLine: TncLine;
+    const aBuf: TBytes;
     aBufCount: Integer) of object;
 
   TncOnServerConnectDisconnect = procedure(
-    Sender: TObject; 
+    Sender: TObject;
     aLine: TncLine) of object;
 
   TncOnServerReconnected = procedure(
-    Sender: TObject; 
+    Sender: TObject;
     aLine: TncLine) of object;
 
 const
@@ -88,7 +91,7 @@ type
   // TncSocketBase
   // Base class for TncTCPServerThd and TncTCPClientThd providing thread pool data processing
   // Copies the TncSourceBase pattern but for raw data instead of commands
-  
+
   TncSocketBase = class(TComponent)
   private
     FDataProcessorThreadPriority: TncThreadPriority;
@@ -96,12 +99,12 @@ type
     FDataProcessorThreadsPerCPU: Integer;
     FDataProcessorThreadsGrowUpto: Integer;
     FEventsUseMainThread: Boolean;
-    
+
     FOnConnected: TncOnServerConnectDisconnect;
     FOnDisconnected: TncOnServerConnectDisconnect;
     FOnReconnected: TncOnServerReconnected;
     FOnReadData: TncOnServerReadData;
-    
+
     // Socket property delegation getters/setters
     function GetActive: Boolean;
     procedure SetActive(const Value: Boolean);
@@ -129,7 +132,7 @@ type
     procedure SetIgnoreCertificateErrors(const Value: Boolean);
     function GetPrivateKeyPassword: string;
     procedure SetPrivateKeyPassword(const Value: string);
-    
+
     // Thread pool property getters/setters
     function GetDataProcessorThreadPriority: TncThreadPriority;
     procedure SetDataProcessorThreadPriority(const Value: TncThreadPriority);
@@ -146,12 +149,12 @@ type
     WasSetActive: Boolean;
     WithinConnectionHandler: Boolean;
   protected
-    PropertyLock: TCriticalSection;
+    PropertyLock: TObject; // TMonitor synchronization object
     DataProcessorThreadPool: TncThreadPool;
     Socket: TncTCPBase;
-    
+
     LastConnectedLine, LastDisconnectedLine, LastReconnectedLine: TncLine;
-    
+
     procedure Loaded; override;
     procedure TLSHandshakeWrapper(aLine: TncLine);
     procedure CallConnectedEvents;
@@ -164,7 +167,7 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
-    
+
     function GetThreadPoolThreadCount: Integer;
     function GetThreadPoolActiveThreadCount: Integer;
   published
@@ -182,14 +185,14 @@ type
     property CertificateFile: string read GetCertificateFile write SetCertificateFile;
     property IgnoreCertificateErrors: Boolean read GetIgnoreCertificateErrors write SetIgnoreCertificateErrors default DefIgnoreCertificateErrors;
     property PrivateKeyPassword: string read GetPrivateKeyPassword write SetPrivateKeyPassword;
-    
-    // Thread pool properties  
+
+    // Thread pool properties
     property DataProcessorThreadPriority: TncThreadPriority read GetDataProcessorThreadPriority write SetDataProcessorThreadPriority default DefDataProcessorThreadPriority;
     property DataProcessorThreads: Integer read GetDataProcessorThreads write SetDataProcessorThreads default DefDataProcessorThreads;
     property DataProcessorThreadsPerCPU: Integer read GetDataProcessorThreadsPerCPU write SetDataProcessorThreadsPerCPU default DefDataProcessorThreadsPerCPU;
     property DataProcessorThreadsGrowUpto: Integer read GetDataProcessorThreadsGrowUpto write SetDataProcessorThreadsGrowUpto default DefDataProcessorThreadsGrowUpto;
     property EventsUseMainThread: Boolean read GetEventsUseMainThread write SetEventsUseMainThread default DefServerEventsUseMainThread;
-    
+
     // Events
     property OnConnected: TncOnServerConnectDisconnect read FOnConnected write FOnConnected;
     property OnDisconnected: TncOnServerConnectDisconnect read FOnDisconnected write FOnDisconnected;
@@ -200,7 +203,7 @@ type
   // TDataProcessingThread
   // Worker thread that processes raw data from the thread pool
   // Copies the THandleCommandThread pattern for consistency
-  
+
   TDataProcessingThread = class(TncReadyThread)
   public
     OnReadData: TncOnServerReadData;
@@ -208,7 +211,7 @@ type
     Line: TncLine;
     Buffer: TBytes;
     BufferCount: Integer;
-    
+
     procedure CallOnReadDataEvent;
     procedure ProcessEvent; override;
   end;
@@ -216,7 +219,7 @@ type
   // /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   // TncTCPServerThd
   // Server component providing raw socket functionality with thread pool processing
-  
+
   TncTCPServerThd = class(TncSocketBase)
   private
     function GetLines: TThreadLineList;
@@ -226,7 +229,7 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
-    
+
     procedure Send(aLine: TncLine; const aBuf; aBufSize: Integer); overload; inline;
     procedure Send(aLine: TncLine; const aBytes: TBytes); overload; inline;
     procedure Send(aLine: TncLine; const aStr: string); overload; inline;
@@ -260,7 +263,7 @@ type
   // /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   // TncTCPClientThd
   // Client component providing raw socket functionality with thread pool processing
-  
+
   TncTCPClientThd = class(TncSocketBase)
   private
     FOnReconnected: TncOnServerReconnected;
@@ -277,13 +280,13 @@ type
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
-    
+
     procedure Send(const aBuf; aBufSize: Integer); overload; inline;
     procedure Send(const aBytes: TBytes); overload; inline;
     procedure Send(const aStr: string); overload; inline;
     function Receive(aTimeout: Cardinal = 2000): TBytes; inline;
     function ReceiveRaw(var aBytes: TBytes): Integer; inline;
-    
+
     property Line: TncLine read GetLine;
   published
     // Inherited properties from TncSocketBase
@@ -308,7 +311,7 @@ type
     property OnConnected;
     property OnDisconnected;
     property OnReadData;
-    
+
     // Client-specific properties
     property Host: string read GetHost write SetHost;
     property Reconnect: Boolean read GetReconnect write SetReconnect default True;
@@ -355,24 +358,24 @@ end;
 constructor TncSocketBase.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
-  
-  PropertyLock := TCriticalSection.Create;
-  
+
+  PropertyLock := TObject.Create;
+
   Socket := nil;
   WasSetActive := False;
   WithinConnectionHandler := False;
-  
+
   FDataProcessorThreadPriority := DefDataProcessorThreadPriority;
   FDataProcessorThreads := DefDataProcessorThreads;
   FDataProcessorThreadsPerCPU := DefDataProcessorThreadsPerCPU;
   FDataProcessorThreadsGrowUpto := DefDataProcessorThreadsGrowUpto;
   FEventsUseMainThread := DefServerEventsUseMainThread;
-  
+
   FOnConnected := nil;
   FOnDisconnected := nil;
   FOnReconnected := nil;
   FOnReadData := nil;
-  
+
   DataProcessorThreadPool := TncThreadPool.Create(TDataProcessingThread);
 end;
 
@@ -396,12 +399,12 @@ end;
 procedure TncSocketBase.Loaded;
 begin
   inherited Loaded;
-  
+
   DataProcessorThreadPool.SetThreadPriority(FDataProcessorThreadPriority);
   DataProcessorThreadPool.SetExecThreads(
     Max(1, Max(FDataProcessorThreads, GetNumberOfProcessors * FDataProcessorThreadsPerCPU)),
     FDataProcessorThreadPriority);
-  
+
   if WasSetActive then
     Socket.Active := True;
 end;
@@ -481,7 +484,7 @@ begin
   // So we can safely queue all data to the thread pool
   if Assigned(OnReadData) then
   begin
-    DataProcessorThreadPool.Serialiser.Acquire;
+    TMonitor.Enter(DataProcessorThreadPool);
     try
       DataProcessingThread := TDataProcessingThread(DataProcessorThreadPool.RequestReadyThread);
       DataProcessingThread.OnReadData := OnReadData;
@@ -491,7 +494,7 @@ begin
       DataProcessingThread.BufferCount := aBufCount;
       DataProcessorThreadPool.RunRequestedThread(DataProcessingThread);
     finally
-      DataProcessorThreadPool.Serialiser.Release;
+      TMonitor.Exit(DataProcessorThreadPool);
     end;
   end;
 end;
@@ -588,7 +591,7 @@ end;
 procedure TncSocketBase.SetUseTLS(const Value: Boolean);
 begin
   Socket.UseTLS := Value;
-  
+
   // Set up TLS handshake callback if Line objects already exist
   // The underlying ncSockets components will handle TLS setup during Line creation
   if Value then
@@ -656,119 +659,119 @@ end;
 // Thread pool property methods
 function TncSocketBase.GetDataProcessorThreadPriority: TncThreadPriority;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FDataProcessorThreadPriority;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncSocketBase.SetDataProcessorThreadPriority(const Value: TncThreadPriority);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FDataProcessorThreadPriority := Value;
     if not (csLoading in ComponentState) then
       DataProcessorThreadPool.SetThreadPriority(Value);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncSocketBase.GetDataProcessorThreads: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FDataProcessorThreads;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncSocketBase.SetDataProcessorThreads(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FDataProcessorThreads := Value;
     if Value <> 0 then
       FDataProcessorThreadsPerCPU := 0;
-    
+
     if not (csLoading in ComponentState) then
       DataProcessorThreadPool.SetExecThreads(
         Max(1, Max(FDataProcessorThreads, GetNumberOfProcessors * FDataProcessorThreadsPerCPU)),
         FDataProcessorThreadPriority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncSocketBase.GetDataProcessorThreadsPerCPU: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FDataProcessorThreadsPerCPU;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncSocketBase.SetDataProcessorThreadsPerCPU(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FDataProcessorThreadsPerCPU := Value;
     if Value <> 0 then
       FDataProcessorThreads := 0;
-    
+
     if not (csLoading in ComponentState) then
       DataProcessorThreadPool.SetExecThreads(
         Max(1, Max(FDataProcessorThreads, GetNumberOfProcessors * FDataProcessorThreadsPerCPU)),
         FDataProcessorThreadPriority);
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncSocketBase.GetDataProcessorThreadsGrowUpto: Integer;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FDataProcessorThreadsGrowUpto;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncSocketBase.SetDataProcessorThreadsGrowUpto(const Value: Integer);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FDataProcessorThreadsGrowUpto := Value;
     if not (csLoading in ComponentState) then
       DataProcessorThreadPool.GrowUpto := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 function TncSocketBase.GetEventsUseMainThread: Boolean;
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     Result := FEventsUseMainThread;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
 procedure TncSocketBase.SetEventsUseMainThread(const Value: Boolean);
 begin
-  PropertyLock.Acquire;
+  TMonitor.Enter(PropertyLock);
   try
     FEventsUseMainThread := Value;
   finally
-    PropertyLock.Release;
+    TMonitor.Exit(PropertyLock);
   end;
 end;
 
@@ -785,7 +788,7 @@ end;
 constructor TncTCPServerThd.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
-  
+
   // Create the underlying TCP server socket
   Socket := TncTCPServer.Create(Self);
   Socket.Family := afIPv4;
@@ -846,7 +849,7 @@ end;
 constructor TncTCPClientThd.Create(AOwner: TComponent);
 begin
   inherited Create(AOwner);
-  
+
   Socket := TncTCPClient.Create(Self);
   Socket.Family := afIPv4;
   Socket.Port := DefPort;
@@ -935,4 +938,5 @@ begin
   TncTCPClient(Socket).ReaderThreadPriority := Value;
 end;
 
-end. 
+end.
+
